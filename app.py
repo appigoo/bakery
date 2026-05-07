@@ -1265,7 +1265,7 @@ def main():
             sel_d = next(d for d in valid_with_hist if d["symbol"] == sel_sym)
             fig_hist = chart_hist_pe(sel_d["hist_pe"], sel_sym, sel_d.get("pe"))
             if fig_hist:
-                st.plotly_chart(fig_hist, use_container_width=True)
+                st.plotly_chart(fig_hist, use_container_width=True, key="hist_pe_tab1")
 
             # Scoring reasons
             sc = score_stock(sel_d)
@@ -1286,24 +1286,24 @@ def main():
 
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(chart_pe_comparison(stocks_data), use_container_width=True)
+            st.plotly_chart(chart_pe_comparison(stocks_data), use_container_width=True, key="chart_pe")
         with c2:
-            st.plotly_chart(chart_ps_comparison(stocks_data), use_container_width=True)
+            st.plotly_chart(chart_ps_comparison(stocks_data), use_container_width=True, key="chart_ps")
 
         st.markdown("---")
         c3, c4 = st.columns(2)
         with c3:
-            st.plotly_chart(chart_fcf_comparison(stocks_data), use_container_width=True)
+            st.plotly_chart(chart_fcf_comparison(stocks_data), use_container_width=True, key="chart_fcf")
         with c4:
             # Radar: select one stock
             valid_s = [d for d in stocks_data if not d.get("error")]
             if valid_s:
                 sel2 = st.selectbox("雷達圖股票", [d["symbol"] for d in valid_s], key="radar_sel")
                 d2   = next(d for d in valid_s if d["symbol"]==sel2)
-                st.plotly_chart(chart_radar(d2, score_stock(d2)), use_container_width=True)
+                st.plotly_chart(chart_radar(d2, score_stock(d2)), use_container_width=True, key=f"chart_radar_{sel2}")
 
         st.markdown("---")
-        st.plotly_chart(chart_quadrant(stocks_data), use_container_width=True)
+        st.plotly_chart(chart_quadrant(stocks_data), use_container_width=True, key="chart_quadrant")
 
         # EPS surprise
         st.markdown("---")
@@ -1451,7 +1451,7 @@ def main():
                 # Hist PE chart inline
                 fig_h = chart_hist_pe(d.get("hist_pe", []), d["symbol"], d.get("pe"))
                 if fig_h:
-                    st.plotly_chart(fig_h, use_container_width=True)
+                    st.plotly_chart(fig_h, use_container_width=True, key=f"hist_pe_{d['symbol']}_tab4")
 
     # ── AUTO REFRESH ──────────────────────────────────────────────────────────
     if st.session_state.auto_refresh:
