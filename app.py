@@ -334,19 +334,20 @@ def inject_css():
     """, unsafe_allow_html=True)
 
 # ── INDUSTRY BENCHMARKS ──────────────────────────────────────────────────────
+# Source: GuruFocus / MacroTrends verified 5-year median P/E (May 2026)
 INDUSTRY_PE = {
-    "Technology": 28.0,
-    "Consumer Electronics": 25.0,
-    "Software": 35.0,
-    "Semiconductors": 30.0,
-    "Internet Content & Information": 30.0,
-    "Auto Manufacturers": 15.0,
-    "Financial Services": 14.0,
-    "Healthcare": 22.0,
-    "Energy": 12.0,
-    "Consumer Defensive": 20.0,
-    "Communication Services": 22.0,
-    "default": 25.0,
+    "Technology":                       30.0,   # broad tech 5yr median
+    "Consumer Electronics":             30.0,   # AAPL peer group 5yr avg ~30x
+    "Software":                         35.0,
+    "Semiconductors":                   30.0,
+    "Internet Content & Information":   28.0,
+    "Auto Manufacturers":               15.0,
+    "Financial Services":               14.0,
+    "Healthcare":                       22.0,
+    "Energy":                           12.0,
+    "Consumer Defensive":               20.0,
+    "Communication Services":           22.0,
+    "default":                          25.0,
 }
 INDUSTRY_PS = {
     "Technology": 7.0, "Software": 10.0, "Semiconductors": 8.0,
@@ -388,19 +389,45 @@ def fetch_stock(symbol: str) -> dict:
             qfin = pd.DataFrame()
             qearnings = pd.DataFrame()
 
-        # Historical PE (5yr monthly close + trailing EPS proxy)
+        # trailing EPS — needed for fallback hist PE and return dict
+        trailing_eps = info.get("trailingEps") or 0
+
+        # Historical PE — use actual price history + reported trailing EPS per quarter
+        # Strategy: fetch quarterly EPS history and match with price to get true historical PE
+        hist_pe = []
         try:
             hist = tk.history(period="5y", interval="1mo")
-            hist_prices = hist["Close"].dropna()
-        except Exception:
-            hist_prices = pd.Series(dtype=float)
+            hist_prices = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
 
-        trailing_eps = info.get("trailingEps") or 0
-        hist_pe = []
-        if trailing_eps and trailing_eps > 0 and not hist_prices.empty:
-            # Approximate historical PE using current EPS as proxy
-            for date, p in hist_prices.items():
-                hist_pe.append({"date": date, "pe": round(p / trailing_eps, 2)})
+            # Try to get quarterly earnings history for accurate EPS reconstruction
+            try:
+                q_earn = tk.quarterly_earnings  # index=quarter, cols=[Earnings, Estimate]
+            except Exception:
+                q_earn = None
+
+            if q_earn is not None and not q_earn.empty and not hist_prices.empty:
+                # Build TTM EPS series: for each month, sum the 4 most recent quarters
+                q_earn = q_earn.sort_index()
+                eps_vals = q_earn.get("Earnings", pd.Series(dtype=float))
+
+                # For each month in price history, find TTM EPS (sum of 4 prior quarters)
+                for date, price in hist_prices.items():
+                    prior_q = eps_vals[eps_vals.index <= date]
+                    if len(prior_q) >= 4:
+                        ttm_eps = prior_q.iloc[-4:].sum()
+                        if ttm_eps and ttm_eps > 0:
+                            pe_val = round(price / ttm_eps, 2)
+                            if 3 < pe_val < 600:
+                                hist_pe.append({"date": date, "pe": pe_val})
+            else:
+                # Fallback: use current trailing EPS (less accurate but still useful)
+                if trailing_eps and trailing_eps > 0 and not hist_prices.empty:
+                    for date, p in hist_prices.items():
+                        pe_val = round(p / trailing_eps, 2)
+                        if 3 < pe_val < 600:
+                            hist_pe.append({"date": date, "pe": pe_val})
+        except Exception:
+            hist_pe = []
 
         # EPS surprise (last 4 quarters)
         eps_surprise = []
@@ -570,72 +597,70 @@ def fed_adjusted_pe(risk_free_rate_pct: float, equity_risk_premium: float = 5.0)
 
 # ── BAKERY BLURB (rule-based) ─────────────────────────────────────────────────
 def bakery_blurb(d: dict, scoring: dict) -> str:
-    name   = d.get("name", d["symbol"])
+    """Returns plain HTML string (no Markdown) for use inside HTML divs."""
     sym    = d["symbol"]
     pe     = d.get("pe")
-    ps     = d.get("ps")
     gm     = d.get("gross_margin")
     rg     = d.get("rev_growth")
     fcf_y  = d.get("fcf_yield")
     score  = scoring["score"]
     sector = d.get("sector", "")
 
-    # Build narrative
     lines = []
 
     # Opening
     if score >= 65:
-        lines.append(f"**{sym}** 就像一間「物有所值」的麵包店——")
+        lines.append(f"<b>{sym}</b> 就像一間「物有所值」的麵包店——")
     elif score >= 40:
-        lines.append(f"**{sym}** 就像一間「裝修靚但略貴」的麵包店——")
+        lines.append(f"<b>{sym}</b> 就像一間「裝修靚但略貴」的麵包店——")
     else:
-        lines.append(f"**{sym}** 就像一間「名氣大但超出預算」的麵包店——")
+        lines.append(f"<b>{sym}</b> 就像一間「名氣大但超出預算」的麵包店——")
 
     # PE story
     if pe and pe > 0:
-        bench = INDUSTRY_PE.get(sector, 25)
-        wait_yr = int(pe)
+        bench    = INDUSTRY_PE.get(sector, 25)
+        wait_yr  = int(pe)
         if pe < bench * 0.85:
-            lines.append(f"你花 **${pe:.0f}萬** 買下每年賺 $1萬 的店，只需 **{wait_yr}年回本**，比同區麵包店（{bench:.0f}年）更快，算是抵買。")
+            lines.append(f"你花 <b>${pe:.0f}萬</b> 買下每年賺 $1萬 的店，只需 <b>{wait_yr} 年回本</b>，比同區麵包店（{bench:.0f}年）更快，算是抵買。")
         elif pe < bench * 1.2:
-            lines.append(f"你花 **${pe:.0f}萬** 買下每年賺 $1萬 的店，需要 **{wait_yr}年回本**，與同區麵包店（{bench:.0f}年）相若，定價合理。")
+            lines.append(f"你花 <b>${pe:.0f}萬</b> 買下每年賺 $1萬 的店，需要 <b>{wait_yr} 年回本</b>，與同區麵包店（{bench:.0f}年）相若，定價合理。")
         else:
-            lines.append(f"你花 **${pe:.0f}萬** 買下每年賺 $1萬 的店，需要 **{wait_yr}年回本**，比同區麵包店（{bench:.0f}年）貴得多。")
+            lines.append(f"你花 <b>${pe:.0f}萬</b> 買下每年賺 $1萬 的店，需要 <b>{wait_yr} 年回本</b>，比同區麵包店（{bench:.0f}年）貴得多。")
 
-    # Gross margin story
+    # Gross margin
     if gm and gm > 0:
         gm_pct = gm * 100
         if gm_pct > 45:
-            lines.append(f"這間店每賣 $100 的麵包，賺到 **${gm_pct:.0f} 毛利**，即是說材料成本極低，烤箱效率全城最高 🏆")
+            lines.append(f"這間店每賣 $100 的麵包，賺到 <b>${gm_pct:.0f} 毛利</b>，材料成本極低，烤箱效率全城最高 🏆")
         elif gm_pct > 30:
-            lines.append(f"這間店毛利率 **{gm_pct:.0f}%**，算是中上水平，成本控制不錯。")
+            lines.append(f"這間店毛利率 <b>{gm_pct:.0f}%</b>，算是中上水平，成本控制不錯。")
         else:
-            lines.append(f"這間店毛利率只有 **{gm_pct:.0f}%**，原材料佔成本頗高，利潤空間有限。")
+            lines.append(f"這間店毛利率只有 <b>{gm_pct:.0f}%</b>，原材料佔成本頗高，利潤空間有限。")
 
     # Revenue growth
     if rg is not None:
         rg_pct = rg * 100
         if rg_pct > 15:
-            lines.append(f"最近一年麵包銷量急增 **{rg_pct:.1f}%**，即係每個月都有更多新熟客排隊，生意滾雪球。")
+            lines.append(f"最近一年麵包銷量急增 <b>{rg_pct:.1f}%</b>，即係每個月都有更多新熟客排隊，生意滾雪球。")
         elif rg_pct > 0:
-            lines.append(f"麵包銷量穩步增長 **{rg_pct:.1f}%**，生意平穩向上。")
+            lines.append(f"麵包銷量穩步增長 <b>{rg_pct:.1f}%</b>，生意平穩向上。")
         elif rg_pct < 0:
-            lines.append(f"⚠️ 麵包銷量下跌 **{abs(rg_pct):.1f}%**，要留意係短期現象定係長期趨勢。")
+            lines.append(f"⚠️ 麵包銷量下跌 <b>{abs(rg_pct):.1f}%</b>，要留意係短期現象定係長期趨勢。")
 
     # FCF
     if fcf_y is not None:
         if fcf_y > 4:
-            lines.append(f"老闆每年實際落袋現金回報率達 **{fcf_y:.1f}%**，即係每 $100 投資，每年收到 ${fcf_y:.1f} 真實現金，非常健康。💰")
+            lines.append(f"老闆每年實際落袋現金回報率達 <b>{fcf_y:.1f}%</b>，即係每 $100 投資每年收到 ${fcf_y:.1f} 真實現金，非常健康 💰")
         elif fcf_y < 0:
             lines.append(f"⚠️ 老闆現金流為負（{fcf_y:.1f}%），即係店舖支出多過收入，要靠借貸或發新股支撐。")
 
     # Verdict
     if score >= 65:
-        lines.append(f"\n**📍 結論：** 以現價計，這間麵包店定價合理，值得考慮。")
+        lines.append(f"<br><b>📍 結論：</b> 以現價計，這間麵包店定價合理，值得考慮。")
     elif score >= 40:
-        lines.append(f"\n**📍 結論：** 這間麵包店略貴，但品牌有溢價，可以等回調再考慮。")
+        lines.append(f"<br><b>📍 結論：</b> 這間麵包店略貴，但品牌有溢價，可以等回調再考慮。")
     else:
-        lines.append(f"\n**📍 結論：** 現價偏貴，建議等估值回落至更合理水平才入場。")
+        lines.append(f"<br><b>📍 結論：</b> 現價偏貴，建議等估值回落至更合理水平才入場。")
 
     return " ".join(lines)
 
@@ -859,30 +884,46 @@ def chart_radar(d: dict, scoring: dict):
 def chart_hist_pe(hist_pe: list, symbol: str, current_pe: float):
     if not hist_pe: return None
     df = pd.DataFrame(hist_pe)
-    df = df[df["pe"].between(1, 500)]
-    if df.empty: return None
+    df = df[df["pe"].between(3, 500)]
+    if df.empty or len(df) < 6: return None
 
-    avg = df["pe"].mean()
+    avg   = df["pe"].mean()
+    p5    = np.percentile(df["pe"], 5)
+    p95   = np.percentile(df["pe"], 95)
+
     fig = go.Figure()
+    # Shaded band between 25th and 75th percentile
+    p25 = np.percentile(df["pe"], 25)
+    p75 = np.percentile(df["pe"], 75)
+    fig.add_trace(go.Scatter(
+        x=pd.concat([df["date"], df["date"][::-1]]),
+        y=[p75]*len(df) + [p25]*len(df),
+        fill="toself", fillcolor="rgba(200,146,42,0.07)",
+        line=dict(color="rgba(0,0,0,0)"), showlegend=False, hoverinfo="skip"
+    ))
     fig.add_trace(go.Scatter(
         x=df["date"], y=df["pe"], mode="lines",
-        line=dict(color="#c8922a", width=1.5), name="P/E", fill="tozeroy",
-        fillcolor="rgba(200,146,42,0.08)"
+        line=dict(color="#c8922a", width=1.8), name="歷史 P/E",
+        fill="tozeroy", fillcolor="rgba(200,146,42,0.05)"
     ))
     fig.add_hline(y=avg, line_dash="dash", line_color="#2a1d13", line_width=1.5,
-                  annotation_text=f"均值 {avg:.1f}x", annotation_position="right")
-    if current_pe:
+                  annotation_text=f"5年均值 {avg:.1f}x",
+                  annotation_position="bottom right",
+                  annotation_font=dict(size=10, color="#2a1d13"))
+    if current_pe and 3 < current_pe < 500:
         fig.add_hline(y=current_pe, line_dash="dot", line_color="#b84040", line_width=1.5,
-                      annotation_text=f"現在 {current_pe:.1f}x", annotation_position="left")
+                      annotation_text=f"現在 {current_pe:.1f}x",
+                      annotation_position="top right",
+                      annotation_font=dict(size=10, color="#b84040"))
     fig.update_layout(
-        title=f"{symbol} 歷史 P/E（5年）",
-        height=260,
+        title=f"{symbol} 歷史 P/E（5年）— 均值 {avg:.1f}x　低位 {p5:.1f}x　高位 {p95:.1f}x",
+        height=270,
         paper_bgcolor=CHART_THEME["paper_bgcolor"],
         plot_bgcolor=CHART_THEME["plot_bgcolor"],
         font=CHART_THEME["font"],
-        yaxis=dict(gridcolor=CHART_THEME["gridcolor"], title="P/E"),
+        yaxis=dict(gridcolor=CHART_THEME["gridcolor"], title="P/E 倍數"),
         xaxis=dict(gridcolor="rgba(0,0,0,0)"),
-        margin=dict(t=50, b=20, l=20, r=60),
+        margin=dict(t=55, b=20, l=20, r=80),
         showlegend=False,
     )
     return fig
@@ -1333,7 +1374,7 @@ def main():
                 eps_val = d_mos.get("eps", 0)
 
                 req_ret = st.slider("你要求的年回報率 %", 5, 20, 10)
-                growth  = st.slider("預期EPS年增長率 %", 0, 100, 12)
+                growth  = st.slider("預期EPS年增長率 %", 0, 30, 12)
                 years   = st.slider("持有年數", 3, 15, 10)
 
                 fair = margin_of_safety(eps_val, req_ret, growth, years)
