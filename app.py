@@ -1333,7 +1333,7 @@ def main():
                 eps_val = d_mos.get("eps", 0)
 
                 req_ret = st.slider("你要求的年回報率 %", 5, 20, 10)
-                growth  = st.slider("預期EPS年增長率 %", 0, 30, 12)
+                growth  = st.slider("預期EPS年增長率 %", 0, 50, 12)
                 years   = st.slider("持有年數", 3, 15, 10)
 
                 fair = margin_of_safety(eps_val, req_ret, growth, years)
