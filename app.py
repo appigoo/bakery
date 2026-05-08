@@ -9,6 +9,7 @@ import requests
 import time
 import json
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 # ── PAGE CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -1178,6 +1179,189 @@ def render_market_thermometer(stocks_data: list):
     </div>
     """, unsafe_allow_html=True)
 
+# ── AI PROMPT GENERATOR ───────────────────────────────────────────────────────
+def build_prompt(d: dict, sc: dict, ai_name: str) -> str:
+    """Build a rich, data-filled prompt tailored to each AI style."""
+    sym   = d["symbol"]
+    name  = d.get("name", sym)
+    price = d.get("price", "N/A")
+    pe    = d.get("pe")
+    fpe   = d.get("forward_pe")
+    ps    = d.get("ps")
+    pb    = d.get("pb")
+    peg   = d.get("peg")
+    eps   = d.get("eps")
+    gm    = d.get("gross_margin")
+    pm    = d.get("profit_margin")
+    fcf_y = d.get("fcf_yield")
+    rg    = d.get("rev_growth")
+    eg    = d.get("earnings_growth")
+    beta  = d.get("beta")
+    target= d.get("analyst_target")
+    score = sc["score"]
+    signal= sc["signal"]
+    sector= d.get("sector", "科技")
+    band  = get_pe_band(d.get("hist_pe", []))
+
+    def fp(v, decimals=1): return f"{v:.{decimals}f}" if v is not None else "N/A"
+    def fpc(v): return f"{v*100:.1f}%" if v is not None else "N/A"
+
+    bench_pe  = INDUSTRY_PE.get(sector, 25)
+    hist_avg  = f"{band['avg']}x" if band else "N/A"
+    hist_range= f"{band['min']}x – {band['max']}x" if band else "N/A"
+    upside_str = ""
+    if target and price and isinstance(price, (int, float)) and price > 0:
+        upside_str = f"（現價折讓 {fp((target-price)/price*100,1)}%）"
+
+    data_block = f"""【{sym} 即時估值數據 — {datetime.now().strftime("%Y-%m-%d")}】
+公司名稱：{name}
+股票代碼：{sym}（{sector}）
+現價：${price}
+分析師目標價：${fp(target)} {upside_str}
+
+📊 估值指標：
+• P/E（市盈率）：{fp(pe)}x  |  行業均值：{bench_pe}x  |  5年歷史均值：{hist_avg}
+• 歷史P/E區間（5年）：{hist_range}
+• Forward P/E（遠期市盈率）：{fp(fpe)}x
+• P/S（市銷率）：{fp(ps)}x
+• P/B（市帳率）：{fp(pb)}x
+• PEG 比率：{fp(peg)}
+
+💰 盈利能力：
+• EPS（每股盈利）：${fp(eps)}
+• 毛利率：{fpc(gm)}
+• 純利率：{fpc(pm)}
+• 自由現金流率（FCF Yield）：{fp(fcf_y)}%
+
+📈 增長數據：
+• 收入增長（YoY）：{fpc(rg)}
+• 盈利增長（YoY）：{fpc(eg)}
+• Beta（波動性）：{fp(beta)}
+
+🥖 系統估值評分：{score}/100（{signal}）""".strip()
+
+    if ai_name == "Claude":
+        return f"""{data_block}
+
+請你扮演一位資深香港股票分析師，同時是一間麵包店老闆。
+用生動的麵包店比喻，以繁體中文分析以上 {sym} 的估值是否合理。
+
+請覆蓋以下四個方面：
+1. 🥖 麵包店比喻：用賣麵包的邏輯解釋 P/E、P/S、毛利率的意義
+2. 📊 估值判斷：現價 vs 歷史均值 vs 行業均值，係貴定平？
+3. ⚠️ 主要風險：估值面和基本面的最大隱憂各一點
+4. 📍 操作建議：買入 / 持有 / 等待 / 沽出，並說明理由和目標價位
+
+語氣要親切易明，像朋友之間討論投資，避免過於學術化。用繁體中文回答。"""
+
+    elif ai_name == "ChatGPT":
+        return f"""{data_block}
+
+請以繁體中文，用結構化方式分析 {sym} 的股票估值。
+
+請按以下格式回答：
+
+**一、現時估值水平**
+（P/E、P/S 與行業及歷史比較，數字要對應上方數據）
+
+**二、麵包店比喻**
+（用日常生活比喻解釋這隻股票現在貴定平）
+
+**三、優勢與風險**
+（各列出3點，要具體）
+
+**四、結論與建議**
+（明確給出建議買入價位、12個月目標價、止損位）
+
+請保持客觀，所有數字引用請對應上方提供的數據。用繁體中文回答。"""
+
+    elif ai_name == "Gemini":
+        return f"""{data_block}
+
+請以繁體中文，結合當前宏觀經濟環境（美國利率走勢、科技股估值周期、AI發展對行業影響），
+全面分析 {sym} 的估值合理性。
+
+分析框架：
+1. 📈 宏觀環境：現時利率水平如何影響合理 P/E？
+2. 🏭 行業定位：在整個行業中的競爭護城河有多深？
+3. 🥖 麵包店比喻：這間店在整條「科技股麵包街」處於什麼位置？
+4. 🔮 三個情境（未來12個月）：
+   - 牛市情境（Bull Case）：目標價？
+   - 基本情境（Base Case）：目標價？
+   - 熊市情境（Bear Case）：目標價？
+5. 📍 最終建議與主要風險提示
+
+請用繁體中文，語氣專業但易明。"""
+
+    elif ai_name == "Grok":
+        return f"""{data_block}
+
+直接告訴我：{sym} 而家值唔值得買？
+
+用最直接嘅廣東話口語分析：
+1. 條數係咪合理？P/E {fp(pe)}x vs 行業 {bench_pe}x，點睇？
+2. 毛利率 {fpc(gm)} 同 FCF {fp(fcf_y)}%，呢間「麵包店」賺唔賺到錢？
+3. 散戶最容易忽略嘅估值陷阱係咩？
+4. 你會唔會買？幾錢入？幾錢走？
+
+唔需要廢話，直接講結論。用繁體中文。"""
+
+    return data_block
+
+
+def render_ai_prompt_buttons(d: dict, sc: dict):
+    """Render 4 AI buttons — clicking opens the chatbot with prompt pre-filled via URL param."""
+    sym = d["symbol"]
+
+    AI_CONFIG = [
+        ("Claude",  "🟣", "#7C3AED", "https://claude.ai/new?q={prompt}"),
+        ("ChatGPT", "🟢", "#10A37F", "https://chatgpt.com/?q={prompt}"),
+        ("Gemini",  "🔵", "#1A73E8", "https://gemini.google.com/app?q={prompt}"),
+        ("Grok",    "⚫", "#000000", "https://x.com/i/grok?text={prompt}"),
+    ]
+
+    st.markdown(
+        '<div style="font-family:IBM Plex Mono,monospace;font-size:10px;' +
+        'letter-spacing:2px;color:#c8922a;text-transform:uppercase;margin:14px 0 8px">' +
+        '🤖 選擇 AI 分析（點擊直接跳轉，Prompt 已自動填入）</div>',
+        unsafe_allow_html=True
+    )
+
+    cols = st.columns(4)
+    for col, (ai_name, emoji, color, url_tpl) in zip(cols, AI_CONFIG):
+        with col:
+            prompt_text = build_prompt(d, sc, ai_name)
+            encoded     = quote(prompt_text, safe="")
+            url         = url_tpl.format(prompt=encoded)
+            st.markdown(
+                f'<a href="{url}" target="_blank" rel="noopener noreferrer" ' +
+                f'style="display:block;text-align:center;padding:9px 4px;' +
+                f'background:{color};color:#fff;border-radius:5px;' +
+                f'text-decoration:none;font-family:IBM Plex Mono,monospace;' +
+                f'font-size:12px;font-weight:600;letter-spacing:0.5px">' +
+                f'{emoji} {ai_name}</a>',
+                unsafe_allow_html=True
+            )
+
+    # Fallback: collapsible copy box
+    key_show = f"show_prompt_{sym}"
+    if key_show not in st.session_state:
+        st.session_state[key_show] = False
+
+    st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+    toggle_lbl = "📋 顯示 Prompt 文字（備用複製）" if not st.session_state[key_show] else "▲ 收起 Prompt"
+    if st.button(toggle_lbl, key=f"toggle_prompt_{sym}"):
+        st.session_state[key_show] = not st.session_state[key_show]
+
+    if st.session_state[key_show]:
+        ai_choice = st.radio(
+            "AI 風格：", ["Claude", "ChatGPT", "Gemini", "Grok"],
+            horizontal=True, key=f"ai_radio_{sym}", label_visibility="collapsed"
+        )
+        st.code(build_prompt(d, sc, ai_choice), language=None)
+        st.caption("☝️ 全選複製後貼到對應 AI 網頁即可")
+
+
 # ── MAIN APP ──────────────────────────────────────────────────────────────────
 def main():
     init_state()
@@ -1493,6 +1677,9 @@ def main():
                 fig_h = chart_hist_pe(d.get("hist_pe", []), d["symbol"], d.get("pe"))
                 if fig_h:
                     st.plotly_chart(fig_h, use_container_width=True, key=f"hist_pe_{d['symbol']}_tab4")
+
+                st.markdown("---")
+                render_ai_prompt_buttons(d, sc)
 
     # ── AUTO REFRESH ──────────────────────────────────────────────────────────
     if st.session_state.auto_refresh:
