@@ -393,6 +393,85 @@ def _empty_result(symbol: str) -> dict:
     }
 
 
+
+def _build_hist_eps_av(symbol: str, av_key: str) -> list:
+    """
+    Fetch TRUE quarterly EPS history from Alpha Vantage EARNINGS endpoint.
+    Matches each month's price to the most recent 4 quarters of EPS (TTM).
+    Returns list of {date, eps_ttm, price} — genuine historical data.
+    Costs 2 AV API calls (EARNINGS + TIME_SERIES_MONTHLY).
+    """
+    if not av_key:
+        return []
+    try:
+        base = "https://www.alphavantage.co/query"
+
+        # 1. Quarterly EPS
+        r_earn = requests.get(base, params={
+            "function": "EARNINGS", "symbol": symbol, "apikey": av_key
+        }, timeout=12)
+        earn_data = r_earn.json()
+        q_earnings = earn_data.get("quarterlyEarnings", [])
+        if not q_earnings:
+            return []
+
+        # Build {date -> eps} dict (reportedDate or fiscalDateEnding)
+        eps_by_date = {}
+        for q in q_earnings:
+            dt_str = q.get("reportedDate") or q.get("fiscalDateEnding", "")
+            eps_s  = q.get("reportedEPS", "None")
+            try:
+                if eps_s and eps_s != "None":
+                    eps_by_date[pd.Timestamp(dt_str)] = float(eps_s)
+            except Exception:
+                continue
+
+        if not eps_by_date:
+            return []
+
+        eps_series = pd.Series(eps_by_date).sort_index()
+
+        # 2. Monthly price history
+        r_px = requests.get(base, params={
+            "function": "TIME_SERIES_MONTHLY_ADJUSTED",
+            "symbol": symbol, "apikey": av_key
+        }, timeout=12)
+        px_data   = r_px.json()
+        monthly   = px_data.get("Monthly Adjusted Time Series", {})
+        if not monthly:
+            return []
+
+        # Build TTM EPS for each month
+        result = []
+        for date_str, ohlc in monthly.items():
+            try:
+                date = pd.Timestamp(date_str)
+                px   = float(ohlc.get("5. adjusted close", 0))
+                if px <= 0:
+                    continue
+                # Sum 4 most recent quarters up to this date
+                prior = eps_series[eps_series.index <= date]
+                if len(prior) < 4:
+                    continue
+                ttm_eps = prior.iloc[-4:].sum()
+                if ttm_eps > 0:
+                    result.append({
+                        "date":    date,
+                        "eps_ttm": round(float(ttm_eps), 4),
+                        "price":   round(px, 2),
+                    })
+            except Exception:
+                continue
+
+        # Only keep last 5 years
+        cutoff = pd.Timestamp.now() - pd.DateOffset(years=5)
+        result = [r for r in result if r["date"] >= cutoff]
+        result.sort(key=lambda x: x["date"])
+        return result
+
+    except Exception:
+        return []
+
 def _build_hist_pe(tk, trailing_eps: float) -> list:
     """Try to build accurate historical P/E from quarterly earnings + price history."""
     hist_pe = []
@@ -663,17 +742,32 @@ def _fetch_stock_cached(symbol: str, av_key: str = "", fh_key: str = "") -> dict
     raise RuntimeError(" | ".join(errors))
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_hist_eps_cached(symbol: str, av_key: str) -> list:
+    """Cache AV EPS history for 1 hour (changes slowly)."""
+    return _build_hist_eps_av(symbol, av_key)
+
+
 def fetch_stock(symbol: str, av_key: str = "", fh_key: str = "") -> dict:
     """
     Public fetch function — wraps cached version so errors are never cached.
-    On failure returns error dict immediately (no stale cache of failures).
+    Also enriches result with true EPS history from Alpha Vantage if key available.
     """
     try:
-        return _fetch_stock_cached(symbol, av_key, fh_key)
+        result = _fetch_stock_cached(symbol, av_key, fh_key)
     except Exception as e:
         result = _empty_result(symbol)
         result["error"] = str(e)
         return result
+
+    # Enrich with true EPS history (AV key needed; separate cache 1hr)
+    if av_key and not result.get("hist_eps"):
+        try:
+            result["hist_eps"] = _fetch_hist_eps_cached(symbol, av_key)
+        except Exception:
+            result["hist_eps"] = []
+
+    return result
 
 # ── VALUATION SCORING ─────────────────────────────────────────────────────────
 def score_stock(d: dict) -> dict:
@@ -1311,38 +1405,14 @@ def chart_pe_price_relationship(hist_pe: list, symbol: str, current_pe: float, c
     return fig1, None
 
 
-def _derive_eps_from_hist_pe(hist_pe: list) -> list:
-    """
-    Derive implied EPS from hist_pe records: eps_implied = price / pe.
-    This is mathematically exact and works without any extra API calls.
-    hist_pe records already contain both 'price' and 'pe'.
-    """
-    result = []
-    for rec in hist_pe:
-        pe  = rec.get("pe")
-        px  = rec.get("price")
-        dt  = rec.get("date")
-        if pe and px and pe > 0 and px > 0 and dt is not None:
-            result.append({
-                "date":    dt,
-                "eps_ttm": round(float(px) / float(pe), 4),
-                "price":   round(float(px), 2),
-            })
-    return result
-
-
 def chart_eps_price(hist_eps: list, symbol: str,
                     current_eps: float, current_price: float,
                     hist_pe: list = None) -> tuple:
     """
     Returns (fig_dual, fig_scatter, fig_growth).
-    If hist_eps is empty but hist_pe is provided, derives EPS as price/PE.
-    eps_implied = price ÷ PE — mathematically exact, no extra API needed.
+    Requires true quarterly EPS history (from Alpha Vantage EARNINGS endpoint).
+    Does NOT fall back to price/PE derivation — that produces circular data.
     """
-    # Derive from hist_pe if hist_eps is empty (rate-limited fallback)
-    if (not hist_eps or len(hist_eps) < 6) and hist_pe and len(hist_pe) >= 6:
-        hist_eps = _derive_eps_from_hist_pe(hist_pe)
-
     if not hist_eps or len(hist_eps) < 6:
         return None, None, None
 
@@ -1373,7 +1443,7 @@ def chart_eps_price(hist_eps: list, symbol: str,
         shared_xaxes=True,
         row_heights=[0.52, 0.48],
         vertical_spacing=0.07,
-        subplot_titles=("股價走勢 Price", "每股盈餘 EPS（隱含值 = 股價 ÷ P/E）")
+        subplot_titles=("股價走勢 Price", "每股盈餘 TTM EPS（真實季度數據）")
     )
 
     # Row 1: Price
@@ -1430,7 +1500,7 @@ def chart_eps_price(hist_eps: list, symbol: str,
                        row=2, col=1)
 
     fig1.update_layout(
-        title=f"{symbol}  股價 & TTM EPS 歷史走勢（5年）",
+        title=f"{symbol}  股價 & 真實 TTM EPS 歷史走勢（5年，Alpha Vantage）",
         height=520,
         paper_bgcolor=CHART_THEME["paper_bgcolor"],
         plot_bgcolor=CHART_THEME["plot_bgcolor"],
@@ -1504,7 +1574,7 @@ def chart_eps_price(hist_eps: list, symbol: str,
         ))
 
     fig2.update_layout(
-        title=f"{symbol}  隱含 EPS vs 股價 散點圖（EPS 增長帶動股價上升）",
+        title=f"{symbol}  TTM EPS vs 股價 散點圖（EPS 增長帶動股價上升）",
         height=370,
         paper_bgcolor=CHART_THEME["paper_bgcolor"],
         plot_bgcolor=CHART_THEME["plot_bgcolor"],
@@ -1537,7 +1607,7 @@ def chart_eps_price(hist_eps: list, symbol: str,
                        annotation_position="right",
                        annotation_font=dict(size=9, color="#c8922a"))
         fig3.update_layout(
-            title=f"{symbol}  EPS 隱含同比增長率（YoY %）",
+            title=f"{symbol}  EPS 同比增長率（YoY % — 真實季度數據）",
             height=300,
             paper_bgcolor=CHART_THEME["paper_bgcolor"],
             plot_bgcolor=CHART_THEME["plot_bgcolor"],
@@ -2242,15 +2312,14 @@ def main():
                 cur_eps       = sel_d.get("eps")
                 # Pass hist_pe as fallback — derives eps_implied = price / pe
                 fig_ep1, fig_ep2, fig_ep3 = chart_eps_price(
-                    hist_eps_data, sel_sym, cur_eps, sel_px,
-                    hist_pe=sel_d.get("hist_pe", [])
+                    hist_eps_data, sel_sym, cur_eps, sel_px
                 )
                 if fig_ep1:
                     st.plotly_chart(fig_ep1, use_container_width=True,
                                     key=f"eps_dual_{sel_sym}")
                     st.caption(
-                        "📊 上圖：股價走勢　|　下圖：隱含 EPS（= 股價 ÷ P/E，棒顏色 = YoY增長速度）"
-                        "　🟢深綠 ≥+15%　🟢淺綠 +5%~15%　🟡 +0%~5%　🟠 -10%~0%　🔴 < -10%"
+                        "📊 上圖：股價走勢　|　下圖：TTM EPS（真實季度盈利，來自 Alpha Vantage）"
+                        "　棒顏色 = YoY增長速度：🟢深綠 ≥+15%　🟢淺綠 +5%~15%　🟡 +0%~5%　🟠 -10%~0%　🔴 < -10%"
                     )
                 if fig_ep2:
                     st.plotly_chart(fig_ep2, use_container_width=True,
@@ -2269,7 +2338,23 @@ def main():
                                     key=f"eps_growth_{sel_sym}")
                     st.caption("📊 EPS 同比增長率（YoY%）— 連續正增長代表盈利質素穩定")
                 if not fig_ep1 and not fig_ep2:
-                    st.info("暫無足夠歷史 P/E 數據來推算 EPS（需至少6個月的 P/E 記錄）")
+                    st.markdown("""
+                    <div style="background:#fff9ee;border:1px solid #d4c4a8;
+                                border-left:4px solid #c8922a;border-radius:6px;
+                                padding:16px 20px;font-size:13px;color:#3d2b1f;line-height:1.8">
+                      <div style="font-family:IBM Plex Mono,monospace;font-size:11px;
+                                  color:#c8922a;font-weight:600;margin-bottom:8px">
+                        💡 需要 Alpha Vantage API Key 才能顯示真實 EPS 歷史
+                      </div>
+                      EPS 歷史數據需要來自 <b>Alpha Vantage EARNINGS 端點</b>的真實季度盈利記錄。<br>
+                      用股價 ÷ P/E 推算 EPS 是<b>循環計算</b>（因 P/E 本身已用現在 EPS 計算），結果無意義。<br><br>
+                      <b>解決方法：</b>在左側欄填入免費 Alpha Vantage Key，每日免費25次查詢足夠使用。<br>
+                      <a href="https://www.alphavantage.co/support/#api-key" target="_blank"
+                         style="color:#c8922a;font-weight:600">
+                        🔑 免費申請 Alpha Vantage Key →
+                      </a>
+                    </div>
+                    """, unsafe_allow_html=True)
 
             # Scoring reasons (always show)
             sc = score_stock(sel_d)
@@ -2477,8 +2562,7 @@ def main():
                 h_eps_t4 = d.get("hist_eps", [])
                 if h_eps_t4:
                     fe1, fe2, fe3 = chart_eps_price(
-                    h_eps_t4, sym_k, d.get("eps"), c_px,
-                    hist_pe=d.get("hist_pe", [])
+                    h_eps_t4, sym_k, d.get("eps"), c_px
                 )
                     if fe1:
                         st.plotly_chart(fe1, use_container_width=True,
