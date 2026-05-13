@@ -408,6 +408,7 @@ def _build_hist_pe(tk, trailing_eps: float) -> list:
             eps_vals = None
 
         for date, p in hist_prices.items():
+            price_rounded = round(float(p), 2)
             if eps_vals is not None:
                 prior = eps_vals[eps_vals.index <= date]
                 if len(prior) >= 4:
@@ -415,13 +416,13 @@ def _build_hist_pe(tk, trailing_eps: float) -> list:
                     if ttm and ttm > 0:
                         pe_v = round(p / ttm, 2)
                         if 3 < pe_v < 600:
-                            hist_pe.append({"date": date, "pe": pe_v})
+                            hist_pe.append({"date": date, "pe": pe_v, "price": price_rounded})
                         continue
             # fallback: current EPS proxy
             if trailing_eps and trailing_eps > 0:
                 pe_v = round(p / trailing_eps, 2)
                 if 3 < pe_v < 600:
-                    hist_pe.append({"date": date, "pe": pe_v})
+                    hist_pe.append({"date": date, "pe": pe_v, "price": price_rounded})
     except Exception:
         pass
     return hist_pe
@@ -1105,6 +1106,203 @@ def chart_hist_pe(hist_pe: list, symbol: str, current_pe: float):
     )
     return fig
 
+
+def chart_pe_price_relationship(hist_pe: list, symbol: str, current_pe: float, current_price: float):
+    """
+    Dual-axis chart: Price (left Y) + P/E (right Y) over time.
+    Shaded zones show cheap / fair / expensive P/E bands.
+    Scatter overlay shows P/E vs Price correlation.
+    Returns (fig_dual, fig_scatter) tuple.
+    """
+    if not hist_pe or len(hist_pe) < 6:
+        return None, None
+
+    df = pd.DataFrame(hist_pe).copy()
+    df = df[df["pe"].between(3, 500)].copy()
+    if df.empty or len(df) < 6:
+        return None, None
+
+    # Reconstruct approximate price from PE * trailing EPS proxy
+    # hist_pe entries have {"date": ..., "pe": ...}
+    # We also stored price in _build_hist_pe via hist_prices — re-derive from pe * eps
+    # Since price = pe * ttm_eps at that date, and we stored pe but not price,
+    # we use the price column if present, else skip price axis
+    has_price = "price" in df.columns and df["price"].notna().sum() > 4
+
+    avg_pe = df["pe"].mean()
+    p25    = np.percentile(df["pe"], 25)
+    p75    = np.percentile(df["pe"], 75)
+    p10    = np.percentile(df["pe"], 10)
+    p90    = np.percentile(df["pe"], 90)
+
+    # ── Chart 1: P/E over time with price overlay (dual axis) ─────────────
+    fig1 = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.55, 0.45],
+        vertical_spacing=0.06,
+        subplot_titles=("股價走勢", "P/E 市盈率走勢")
+    )
+
+    dates = df["date"]
+
+    # — Row 1: Price (if available) or PE-implied price band —
+    if has_price:
+        fig1.add_trace(go.Scatter(
+            x=dates, y=df["price"], mode="lines", name="股價",
+            line=dict(color="#c8922a", width=2),
+            fill="tozeroy", fillcolor="rgba(200,146,42,0.06)"
+        ), row=1, col=1)
+    else:
+        # Show PE bands translated to "fair value price" zones using current EPS as proxy
+        # (approximate only — indicated in chart)
+        if current_pe and current_price and current_pe > 0:
+            implied_eps = current_price / current_pe
+            fig1.add_trace(go.Scatter(
+                x=dates,
+                y=[p * implied_eps for p in df["pe"]],
+                mode="lines", name="估算股價（以EPS代理）",
+                line=dict(color="#c8922a", width=1.8, dash="dot"),
+                fill="tozeroy", fillcolor="rgba(200,146,42,0.05)"
+            ), row=1, col=1)
+            # Fair value band
+            fig1.add_hrect(
+                y0=avg_pe * implied_eps * 0.9, y1=avg_pe * implied_eps * 1.1,
+                fillcolor="rgba(74,154,74,0.08)", line_width=0,
+                annotation_text="合理價值區", annotation_position="top left",
+                annotation_font=dict(size=9, color="#4a9a4a"), row=1, col=1
+            )
+            if current_price:
+                fig1.add_hline(y=current_price, line_dash="dot",
+                               line_color="#b84040", line_width=1.5,
+                               annotation_text=f"現價 ${current_price:.0f}",
+                               annotation_position="right",
+                               annotation_font=dict(size=9, color="#b84040"),
+                               row=1, col=1)
+
+    # — Row 2: P/E over time with coloured zones —
+    # Cheap zone (below p25)
+    fig1.add_hrect(
+        y0=max(0, p10), y1=p25,
+        fillcolor="rgba(74,154,74,0.10)", line_width=0,
+        annotation_text="便宜區", annotation_position="top left",
+        annotation_font=dict(size=9, color="#3a7a3a"), row=2, col=1
+    )
+    # Expensive zone (above p75)
+    fig1.add_hrect(
+        y0=p75, y1=min(p90 * 1.1, 300),
+        fillcolor="rgba(184,64,64,0.08)", line_width=0,
+        annotation_text="偏貴區", annotation_position="top left",
+        annotation_font=dict(size=9, color="#b84040"), row=2, col=1
+    )
+
+    # P/E line — coloured by zone
+    pe_colors = []
+    for pe_v in df["pe"]:
+        if pe_v <= p25:   pe_colors.append("#4a9a4a")
+        elif pe_v >= p75: pe_colors.append("#b84040")
+        else:             pe_colors.append("#c8922a")
+
+    fig1.add_trace(go.Scatter(
+        x=dates, y=df["pe"], mode="lines", name="P/E",
+        line=dict(color="#c8922a", width=2),
+    ), row=2, col=1)
+
+    # Average PE line
+    fig1.add_hline(y=avg_pe, line_dash="dash", line_color="#2a1d13",
+                   line_width=1.2, annotation_text=f"均值 {avg_pe:.1f}x",
+                   annotation_position="bottom right",
+                   annotation_font=dict(size=9, color="#2a1d13"), row=2, col=1)
+
+    # Current PE marker
+    if current_pe and 3 < current_pe < 500:
+        fig1.add_hline(y=current_pe, line_dash="dot", line_color="#b84040",
+                       line_width=1.5, annotation_text=f"現在 {current_pe:.1f}x",
+                       annotation_position="top right",
+                       annotation_font=dict(size=9, color="#b84040"), row=2, col=1)
+
+    fig1.update_layout(
+        title=f"{symbol}  股價 & P/E 歷史走勢（5年）",
+        height=500,
+        paper_bgcolor=CHART_THEME["paper_bgcolor"],
+        plot_bgcolor=CHART_THEME["plot_bgcolor"],
+        font=CHART_THEME["font"],
+        showlegend=False,
+        margin=dict(t=60, b=20, l=20, r=80),
+    )
+    fig1.update_yaxes(gridcolor=CHART_THEME["gridcolor"])
+    fig1.update_xaxes(gridcolor="rgba(0,0,0,0)", row=1, col=1)
+    fig1.update_xaxes(gridcolor="rgba(0,0,0,0)", row=2, col=1)
+    fig1.update_yaxes(title_text="股價 (USD)", row=1, col=1)
+    fig1.update_yaxes(title_text="P/E 倍數", row=2, col=1)
+
+    # ── Chart 2: Scatter — P/E vs Price (correlation) ─────────────────────
+    if has_price:
+        # Colour points by PE zone
+        point_colors = []
+        for pe_v in df["pe"]:
+            if pe_v <= p25:   point_colors.append("#4a9a4a")
+            elif pe_v >= p75: point_colors.append("#b84040")
+            else:             point_colors.append("#c8922a")
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=df["pe"], y=df["price"],
+            mode="markers",
+            marker=dict(color=point_colors, size=7, opacity=0.75,
+                        line=dict(width=0.5, color="#2a1d13")),
+            text=[str(d)[:7] for d in df["date"]],
+            hovertemplate="P/E: %{x:.1f}x<br>股價: $%{y:.0f}<br>%{text}<extra></extra>",
+            name="月度數據"
+        ))
+
+        # Regression line
+        if len(df) > 5:
+            z = np.polyfit(df["pe"], df["price"], 1)
+            p_fn = np.poly1d(z)
+            pe_range = np.linspace(df["pe"].min(), df["pe"].max(), 50)
+            fig2.add_trace(go.Scatter(
+                x=pe_range, y=p_fn(pe_range),
+                mode="lines", line=dict(color="#2a1d13", dash="dash", width=1.5),
+                name="趨勢線", showlegend=False
+            ))
+            # Correlation coefficient
+            corr = np.corrcoef(df["pe"], df["price"])[0, 1]
+            fig2.add_annotation(
+                x=0.02, y=0.96, xref="paper", yref="paper",
+                text=f"相關係數 r = {corr:.2f}",
+                showarrow=False, font=dict(size=10, color="#2a1d13"),
+                bgcolor="rgba(255,253,248,0.85)", bordercolor=CHART_THEME["gridcolor"],
+                borderwidth=1
+            )
+
+        # Mark current point
+        if current_pe and current_price:
+            fig2.add_trace(go.Scatter(
+                x=[current_pe], y=[current_price],
+                mode="markers+text",
+                marker=dict(color="#b84040", size=12, symbol="star",
+                            line=dict(width=1.5, color="#2a1d13")),
+                text=["現在"], textposition="top right",
+                textfont=dict(size=10, color="#b84040"),
+                name="現在", showlegend=False
+            ))
+
+        fig2.update_layout(
+            title=f"{symbol}  P/E vs 股價 散點圖（P/E 愈高，市場情緒愈樂觀）",
+            height=350,
+            paper_bgcolor=CHART_THEME["paper_bgcolor"],
+            plot_bgcolor=CHART_THEME["plot_bgcolor"],
+            font=CHART_THEME["font"],
+            xaxis=dict(title="P/E 倍數", gridcolor=CHART_THEME["gridcolor"]),
+            yaxis=dict(title="股價 (USD)", gridcolor=CHART_THEME["gridcolor"]),
+            margin=dict(t=55, b=30, l=20, r=20),
+            showlegend=False,
+        )
+        return fig1, fig2
+
+    return fig1, None
+
 def chart_quadrant(stocks_data: list):
     syms, pe_ratios, rg_vals, sizes, colors_q, scores_q = [], [], [], [], [], []
     for d in stocks_data:
@@ -1727,12 +1925,64 @@ def main():
         valid_with_hist = [d for d in valid_stocks if d.get("hist_pe")]
         if valid_with_hist:
             sel_sym = st.selectbox("選擇股票查看歷史P/E", [d["symbol"] for d in valid_with_hist])
-            sel_d = next(d for d in valid_with_hist if d["symbol"] == sel_sym)
-            fig_hist = chart_hist_pe(sel_d["hist_pe"], sel_sym, sel_d.get("pe"))
-            if fig_hist:
-                st.plotly_chart(fig_hist, use_container_width=True, key="hist_pe_tab1")
+            sel_d   = next(d for d in valid_with_hist if d["symbol"] == sel_sym)
+            sel_pe  = sel_d.get("pe")
+            sel_px  = sel_d.get("price")
 
-            # Scoring reasons
+            # Sub-tabs for different chart views
+            ctab1, ctab2, ctab3 = st.tabs(["📉 P/E 走勢", "🔗 股價 & P/E 雙軸圖", "🔵 P/E vs 股價 散點"])
+
+            with ctab1:
+                fig_hist = chart_hist_pe(sel_d["hist_pe"], sel_sym, sel_pe)
+                if fig_hist:
+                    st.plotly_chart(fig_hist, use_container_width=True, key="hist_pe_tab1")
+                # Bakery valuation band note
+                band = get_pe_band(sel_d["hist_pe"])
+                if band and sel_pe:
+                    pct = (sel_pe - band["min"]) / max(band["max"] - band["min"], 1) * 100
+                    zone = "便宜區 🟢" if sel_pe <= band["avg"]*0.85 else "偏貴區 🔴" if sel_pe >= band["avg"]*1.2 else "合理區 🟡"
+                    st.markdown(f"""
+                    <div class="bakery-box">
+                      <div class="bakery-title">🥖 {sel_sym} 歷史 P/E 麵包店解讀</div>
+                      現在的 P/E <b>{sel_pe:.1f}x</b> 落在過去5年的 <b>{pct:.0f}%</b> 分位數，屬於 <b>{zone}</b>。<br>
+                      5年均值 {band["avg"]}x　|　歷史低位 {band["min"]}x　|　歷史高位 {band["max"]}x<br>
+                      🥖 比喻：如果過去5年這間麵包店平均要 <b>{band["avg"]}年</b> 回本，
+                      現在要 <b>{sel_pe:.0f}年</b>，
+                      {"比歷史均值貴了不少。" if sel_pe > band["avg"]*1.15 else "與歷史均值相若，定價合理。" if sel_pe > band["avg"]*0.9 else "比歷史均值便宜，值得留意。"}
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            with ctab2:
+                fig_dual, fig_scatter = chart_pe_price_relationship(
+                    sel_d["hist_pe"], sel_sym, sel_pe, sel_px
+                )
+                if fig_dual:
+                    st.plotly_chart(fig_dual, use_container_width=True, key=f"dual_{sel_sym}")
+                    st.caption(
+                        "📊 上圖：股價走勢（或估算股價）｜下圖：P/E走勢，"
+                        "🟢 綠色區 = 歷史便宜　🔴 紅色區 = 歷史偏貴"
+                    )
+                else:
+                    st.info("數據不足，無法生成雙軸圖")
+
+            with ctab3:
+                _, fig_scatter2 = chart_pe_price_relationship(
+                    sel_d["hist_pe"], sel_sym, sel_pe, sel_px
+                )
+                if fig_scatter2:
+                    st.plotly_chart(fig_scatter2, use_container_width=True, key=f"scatter_{sel_sym}")
+                    st.markdown("""
+                    <div style="font-size:12px;color:#7a6a5a;margin-top:-8px;padding:8px 12px;
+                                background:#f5efe3;border-radius:4px">
+                    🥖 <b>麵包店比喻：</b>散點圖顯示「出價（P/E）」與「店舖估值（股價）」的關係。
+                    🟢 綠點 = 當時市場出價便宜　🔴 紅點 = 出價偏貴　⭐ = 現在位置。
+                    相關係數愈接近 1，代表 P/E 與股價同步性愈高。
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.info("需要完整股價數據才能生成散點圖（yfinance 數據源）")
+
+            # Scoring reasons (always show)
             sc = score_stock(sel_d)
             if sc["reasons"]:
                 st.markdown(f"""
@@ -1913,10 +2163,26 @@ def main():
                     for r in sc["reasons"]:
                         st.markdown(f"- {r}")
 
-                # Hist PE chart inline
-                fig_h = chart_hist_pe(d.get("hist_pe", []), d["symbol"], d.get("pe"))
+                # Hist PE + relationship charts
+                h_pe   = d.get("hist_pe", [])
+                sym_k  = d["symbol"]
+                c_pe   = d.get("pe")
+                c_px   = d.get("price")
+
+                fig_h = chart_hist_pe(h_pe, sym_k, c_pe)
                 if fig_h:
-                    st.plotly_chart(fig_h, use_container_width=True, key=f"hist_pe_{d['symbol']}_tab4")
+                    st.plotly_chart(fig_h, use_container_width=True,
+                                    key=f"hist_pe_{sym_k}_tab4")
+
+                fig_dual_t4, fig_scat_t4 = chart_pe_price_relationship(
+                    h_pe, sym_k, c_pe, c_px
+                )
+                if fig_dual_t4:
+                    st.plotly_chart(fig_dual_t4, use_container_width=True,
+                                    key=f"dual_{sym_k}_tab4")
+                if fig_scat_t4:
+                    st.plotly_chart(fig_scat_t4, use_container_width=True,
+                                    key=f"scat_{sym_k}_tab4")
 
                 st.markdown("---")
                 render_ai_prompt_buttons(d, sc)
