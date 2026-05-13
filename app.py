@@ -2524,12 +2524,11 @@ def render_breakout_tab(stocks_data: list, av_key: str):
     # Height: header(80) + KPI(90) + filters(40) + chart(320) + legend(36) +
     #         thead(32) + rows(28px each) + datasrc(40) + padding(60)
     # TSLA has 26 fixed rows; other stocks use hist_pe length
-    if sym == "TSLA":
+    if sel_sym == "TSLA":
         n_data_rows = 26
     elif d.get("hist_eps"):
         n_data_rows = min(len(d["hist_eps"]), 60)
     elif d.get("hist_pe"):
-        # hist_pe sampled quarterly ~= len/3
         n_data_rows = min(len(d["hist_pe"]) // 3 + 2, 60)
     else:
         n_data_rows = 4
