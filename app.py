@@ -371,125 +371,301 @@ def init_state():
         if k not in st.session_state:
             st.session_state[k] = v
 
-# ── DATA FETCHING ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_stock(symbol: str) -> dict:
+# ── DATA FETCHING — 4-layer fallback ─────────────────────────────────────────
+# Layer 1: yfinance with curl_cffi Chrome impersonation
+# Layer 2: Alpha Vantage REST API (free tier, needs ALPHA_VANTAGE_KEY)
+# Layer 3: Finnhub REST API (free tier, needs FINNHUB_KEY)
+# Layer 4: Hardcoded cache of last known good data (staleness noted in UI)
+
+def _empty_result(symbol: str) -> dict:
+    """Skeleton dict with all keys so downstream code never KeyErrors."""
+    return {
+        "symbol": symbol.upper(), "name": symbol.upper(), "price": 0,
+        "prev_close": 0, "change_pct": 0, "pe": None, "forward_pe": None,
+        "ps": None, "pb": None, "eps": None, "peg": None,
+        "gross_margin": None, "profit_margin": None, "fcf": None,
+        "fcf_yield": None, "mkt_cap": None, "sector": "default",
+        "industry": "", "52w_high": None, "52w_low": None, "beta": None,
+        "revenue": None, "net_income": None, "rev_growth": None,
+        "earnings_growth": None, "analyst_target": None,
+        "hist_pe": [], "eps_surprise": [], "dividend_yield": None,
+        "short_ratio": None, "data_source": "none", "error": None,
+    }
+
+
+def _build_hist_pe(tk, trailing_eps: float) -> list:
+    """Try to build accurate historical P/E from quarterly earnings + price history."""
+    hist_pe = []
     try:
-        tk = yf.Ticker(symbol)
-        info = tk.info or {}
-
-        price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
-        prev  = info.get("previousClose") or price
-        chg   = ((price - prev) / prev * 100) if prev else 0
-
-        # Financials for EPS surprise
+        hist        = tk.history(period="5y", interval="1mo")
+        hist_prices = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
+        if hist_prices.empty:
+            return []
         try:
-            qfin = tk.quarterly_financials
-            qearnings = tk.quarterly_earnings
+            q_earn   = tk.quarterly_earnings
+            eps_vals = q_earn.sort_index().get("Earnings", pd.Series(dtype=float)) if (q_earn is not None and not q_earn.empty) else None
         except Exception:
-            qfin = pd.DataFrame()
-            qearnings = pd.DataFrame()
+            eps_vals = None
 
-        # trailing EPS — needed for fallback hist PE and return dict
-        trailing_eps = info.get("trailingEps") or 0
+        for date, p in hist_prices.items():
+            if eps_vals is not None:
+                prior = eps_vals[eps_vals.index <= date]
+                if len(prior) >= 4:
+                    ttm = prior.iloc[-4:].sum()
+                    if ttm and ttm > 0:
+                        pe_v = round(p / ttm, 2)
+                        if 3 < pe_v < 600:
+                            hist_pe.append({"date": date, "pe": pe_v})
+                        continue
+            # fallback: current EPS proxy
+            if trailing_eps and trailing_eps > 0:
+                pe_v = round(p / trailing_eps, 2)
+                if 3 < pe_v < 600:
+                    hist_pe.append({"date": date, "pe": pe_v})
+    except Exception:
+        pass
+    return hist_pe
 
-        # Historical PE — use actual price history + reported trailing EPS per quarter
-        # Strategy: fetch quarterly EPS history and match with price to get true historical PE
-        hist_pe = []
-        try:
-            hist = tk.history(period="5y", interval="1mo")
-            hist_prices = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
 
-            # Try to get quarterly earnings history for accurate EPS reconstruction
-            try:
-                q_earn = tk.quarterly_earnings  # index=quarter, cols=[Earnings, Estimate]
-            except Exception:
-                q_earn = None
+def _fetch_yfinance(symbol: str) -> dict:
+    """Layer 1: yfinance (works locally, may be rate-limited on Streamlit Cloud)."""
+    tk   = yf.Ticker(symbol)
+    info = tk.info or {}
+    if not info or not info.get("regularMarketPrice") and not info.get("currentPrice"):
+        raise ValueError("Empty info from yfinance")
 
-            if q_earn is not None and not q_earn.empty and not hist_prices.empty:
-                # Build TTM EPS series: for each month, sum the 4 most recent quarters
-                q_earn = q_earn.sort_index()
-                eps_vals = q_earn.get("Earnings", pd.Series(dtype=float))
+    price        = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+    prev         = info.get("previousClose") or price
+    chg          = ((price - prev) / prev * 100) if prev else 0
+    trailing_eps = info.get("trailingEps") or 0
+    op_cf        = info.get("operatingCashflow") or 0
+    capex        = abs(info.get("capitalExpenditures") or 0)
+    fcf          = op_cf - capex
+    mkt_cap      = info.get("marketCap") or 0
 
-                # For each month in price history, find TTM EPS (sum of 4 prior quarters)
-                for date, price in hist_prices.items():
-                    prior_q = eps_vals[eps_vals.index <= date]
-                    if len(prior_q) >= 4:
-                        ttm_eps = prior_q.iloc[-4:].sum()
-                        if ttm_eps and ttm_eps > 0:
-                            pe_val = round(price / ttm_eps, 2)
-                            if 3 < pe_val < 600:
-                                hist_pe.append({"date": date, "pe": pe_val})
-            else:
-                # Fallback: use current trailing EPS (less accurate but still useful)
-                if trailing_eps and trailing_eps > 0 and not hist_prices.empty:
-                    for date, p in hist_prices.items():
-                        pe_val = round(p / trailing_eps, 2)
-                        if 3 < pe_val < 600:
-                            hist_pe.append({"date": date, "pe": pe_val})
-        except Exception:
-            hist_pe = []
+    try:
+        qearnings = tk.quarterly_earnings
+    except Exception:
+        qearnings = None
 
-        # EPS surprise (last 4 quarters)
-        eps_surprise = []
-        if qearnings is not None and not qearnings.empty:
-            for i, (idx, row) in enumerate(qearnings.iterrows()):
-                if i >= 4:
-                    break
-                actual   = row.get("Earnings", None)
-                estimate = row.get("Estimate", None)
-                if actual is not None and estimate is not None and estimate != 0:
-                    surprise_pct = (actual - estimate) / abs(estimate) * 100
-                    eps_surprise.append({
-                        "quarter": str(idx)[:7],
-                        "actual": actual,
-                        "estimate": estimate,
-                        "surprise_pct": round(surprise_pct, 1),
-                    })
+    eps_surprise = []
+    if qearnings is not None and not qearnings.empty:
+        for i, (idx, row) in enumerate(qearnings.iterrows()):
+            if i >= 4: break
+            actual   = row.get("Earnings")
+            estimate = row.get("Estimate")
+            if actual is not None and estimate and estimate != 0:
+                eps_surprise.append({
+                    "quarter":      str(idx)[:7],
+                    "actual":       actual,
+                    "estimate":     estimate,
+                    "surprise_pct": round((actual - estimate) / abs(estimate) * 100, 1),
+                })
 
-        # FCF
-        op_cf   = info.get("operatingCashflow") or 0
-        capex   = info.get("capitalExpenditures") or 0
-        fcf     = op_cf - abs(capex)
+    result = _empty_result(symbol)
+    result.update({
+        "name":           info.get("longName") or info.get("shortName") or symbol,
+        "price":          round(price, 2),
+        "prev_close":     round(prev, 2),
+        "change_pct":     round(chg, 2),
+        "pe":             info.get("trailingPE"),
+        "forward_pe":     info.get("forwardPE"),
+        "ps":             info.get("priceToSalesTrailing12Months"),
+        "pb":             info.get("priceToBook"),
+        "eps":            trailing_eps,
+        "peg":            info.get("trailingPegRatio"),
+        "gross_margin":   info.get("grossMargins"),
+        "profit_margin":  info.get("profitMargins"),
+        "fcf":            fcf,
+        "fcf_yield":      (fcf / mkt_cap * 100) if mkt_cap else None,
+        "mkt_cap":        mkt_cap,
+        "sector":         info.get("sector") or "default",
+        "industry":       info.get("industry") or "",
+        "52w_high":       info.get("fiftyTwoWeekHigh"),
+        "52w_low":        info.get("fiftyTwoWeekLow"),
+        "beta":           info.get("beta"),
+        "revenue":        info.get("totalRevenue"),
+        "net_income":     info.get("netIncomeToCommon"),
+        "rev_growth":     info.get("revenueGrowth"),
+        "earnings_growth":info.get("earningsGrowth"),
+        "analyst_target": info.get("targetMeanPrice"),
+        "hist_pe":        _build_hist_pe(tk, trailing_eps),
+        "eps_surprise":   eps_surprise,
+        "dividend_yield": info.get("dividendYield"),
+        "short_ratio":    info.get("shortRatio"),
+        "data_source":    "yfinance",
+        "error":          None,
+    })
+    return result
 
-        # Market cap tier
-        mkt_cap = info.get("marketCap") or 0
 
-        return {
-            "symbol":        symbol.upper(),
-            "name":          info.get("longName") or info.get("shortName") or symbol,
-            "price":         round(price, 2),
-            "prev_close":    round(prev, 2),
-            "change_pct":    round(chg, 2),
-            "pe":            info.get("trailingPE"),
-            "forward_pe":    info.get("forwardPE"),
-            "ps":            info.get("priceToSalesTrailing12Months"),
-            "pb":            info.get("priceToBook"),
-            "eps":           trailing_eps,
-            "peg":           info.get("trailingPegRatio"),
-            "gross_margin":  info.get("grossMargins"),
-            "profit_margin": info.get("profitMargins"),
-            "fcf":           fcf,
-            "fcf_yield":     (fcf / mkt_cap * 100) if mkt_cap else None,
-            "mkt_cap":       mkt_cap,
-            "sector":        info.get("sector") or "default",
-            "industry":      info.get("industry") or "",
-            "52w_high":      info.get("fiftyTwoWeekHigh"),
-            "52w_low":       info.get("fiftyTwoWeekLow"),
-            "beta":          info.get("beta"),
-            "revenue":       info.get("totalRevenue"),
-            "net_income":    info.get("netIncomeToCommon"),
-            "rev_growth":    info.get("revenueGrowth"),
-            "earnings_growth": info.get("earningsGrowth"),
-            "analyst_target": info.get("targetMeanPrice"),
-            "hist_pe":       hist_pe,
-            "eps_surprise":  eps_surprise,
-            "dividend_yield": info.get("dividendYield"),
-            "short_ratio":   info.get("shortRatio"),
-            "error":         None,
-        }
+def _fetch_alpha_vantage(symbol: str, api_key: str) -> dict:
+    """Layer 2: Alpha Vantage — OVERVIEW endpoint gives PE, margins, growth etc."""
+    if not api_key:
+        raise ValueError("No Alpha Vantage key")
+
+    base = "https://www.alphavantage.co/query"
+
+    # Company overview (fundamentals)
+    ov = requests.get(base, params={
+        "function": "OVERVIEW", "symbol": symbol, "apikey": api_key
+    }, timeout=10).json()
+    if "Note" in ov or "Information" in ov or not ov.get("Symbol"):
+        raise ValueError(f"Alpha Vantage OVERVIEW failed: {list(ov.keys())[:3]}")
+
+    # Global quote (current price)
+    qt = requests.get(base, params={
+        "function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": api_key
+    }, timeout=10).json().get("Global Quote", {})
+
+    def _f(key, cast=float):
+        try: return cast(ov.get(key, "") or 0) or None
+        except: return None
+
+    def _fq(key, cast=float):
+        try: return cast(qt.get(key, "") or 0) or None
+        except: return None
+
+    price    = _fq("05. price") or 0
+    prev     = _fq("08. previous close") or price
+    chg      = ((price - prev) / prev * 100) if prev else 0
+    mkt_cap  = _f("MarketCapitalization") or 0
+    op_cf    = _f("OperatingCashflow") or 0
+    capex    = _f("CapitalExpenditures") or 0
+    fcf      = op_cf - abs(capex)
+    pe       = _f("PERatio")
+    eps      = _f("EPS")
+
+    result = _empty_result(symbol)
+    result.update({
+        "name":           ov.get("Name", symbol),
+        "price":          round(price, 2),
+        "prev_close":     round(prev, 2),
+        "change_pct":     round(chg, 2),
+        "pe":             pe,
+        "forward_pe":     _f("ForwardPE"),
+        "ps":             _f("PriceToSalesRatioTTM"),
+        "pb":             _f("PriceToBookRatio"),
+        "eps":            eps,
+        "peg":            _f("PEGRatio"),
+        "gross_margin":   _f("GrossProfitTTM") and mkt_cap and (_f("GrossProfitTTM") / max(_f("RevenueTTM") or 1, 1)),
+        "profit_margin":  _f("ProfitMargin"),
+        "fcf":            fcf,
+        "fcf_yield":      (fcf / mkt_cap * 100) if mkt_cap else None,
+        "mkt_cap":        mkt_cap,
+        "sector":         ov.get("Sector", "default"),
+        "industry":       ov.get("Industry", ""),
+        "52w_high":       _f("52WeekHigh"),
+        "52w_low":        _f("52WeekLow"),
+        "beta":           _f("Beta"),
+        "revenue":        _f("RevenueTTM"),
+        "rev_growth":     _f("QuarterlyRevenueGrowthYOY"),
+        "earnings_growth":_f("QuarterlyEarningsGrowthYOY"),
+        "analyst_target": _f("AnalystTargetPrice"),
+        "dividend_yield": _f("DividendYield"),
+        "data_source":    "Alpha Vantage",
+        "error":          None,
+    })
+    return result
+
+
+def _fetch_finnhub(symbol: str, api_key: str) -> dict:
+    """Layer 3: Finnhub — quote + basic financials."""
+    if not api_key:
+        raise ValueError("No Finnhub key")
+
+    headers = {"X-Finnhub-Token": api_key}
+    base    = "https://finnhub.io/api/v1"
+
+    quote   = requests.get(f"{base}/quote", params={"symbol": symbol},
+                           headers=headers, timeout=8).json()
+    metrics = requests.get(f"{base}/stock/metric", params={"symbol": symbol, "metric": "all"},
+                           headers=headers, timeout=8).json().get("metric", {})
+    profile = requests.get(f"{base}/stock/profile2", params={"symbol": symbol},
+                           headers=headers, timeout=8).json()
+
+    price   = quote.get("c") or 0
+    prev    = quote.get("pc") or price
+    chg     = ((price - prev) / prev * 100) if prev else 0
+
+    def _m(key):
+        v = metrics.get(key)
+        return float(v) if v is not None else None
+
+    mkt_cap = (profile.get("marketCapitalization") or 0) * 1e6
+    fcf     = _m("freeCashFlowTTM") or 0
+
+    result = _empty_result(symbol)
+    result.update({
+        "name":           profile.get("name", symbol),
+        "price":          round(price, 2),
+        "prev_close":     round(prev, 2),
+        "change_pct":     round(chg, 2),
+        "pe":             _m("peNormalizedAnnual") or _m("peTTM"),
+        "forward_pe":     _m("forwardPE"),
+        "ps":             _m("psTTM"),
+        "pb":             _m("pbAnnual"),
+        "eps":            _m("epsNormalizedAnnual"),
+        "gross_margin":   _m("grossMarginTTM") and (_m("grossMarginTTM") / 100),
+        "profit_margin":  _m("netProfitMarginTTM") and (_m("netProfitMarginTTM") / 100),
+        "fcf":            fcf * 1e6 if fcf else None,
+        "fcf_yield":      (_m("fcfYieldTTM") or 0),
+        "mkt_cap":        mkt_cap or None,
+        "sector":         profile.get("finnhubIndustry", "default"),
+        "52w_high":       _m("52WeekHigh"),
+        "52w_low":        _m("52WeekLow"),
+        "beta":           _m("beta"),
+        "revenue":        _m("revenuePerShareTTM"),
+        "rev_growth":     _m("revenueGrowthTTMYoy") and (_m("revenueGrowthTTMYoy") / 100),
+        "earnings_growth":_m("epsGrowthTTMYoy") and (_m("epsGrowthTTMYoy") / 100),
+        "analyst_target": _m("targetPrice"),
+        "dividend_yield": _m("dividendYieldIndicatedAnnual") and (_m("dividendYieldIndicatedAnnual") / 100),
+        "data_source":    "Finnhub",
+        "error":          None,
+    })
+    return result
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_stock_cached(symbol: str, av_key: str = "", fh_key: str = "") -> dict:
+    """Cached layer — only successful results are stored for 300s."""
+    errors = []
+
+    # Layer 1: yfinance
+    try:
+        return _fetch_yfinance(symbol)
     except Exception as e:
-        return {"symbol": symbol.upper(), "error": str(e), "price": 0, "change_pct": 0}
+        errors.append(f"yfinance: {str(e)[:80]}")
+
+    # Layer 2: Alpha Vantage
+    if av_key:
+        try:
+            return _fetch_alpha_vantage(symbol, av_key)
+        except Exception as e:
+            errors.append(f"AV: {str(e)[:60]}")
+
+    # Layer 3: Finnhub
+    if fh_key:
+        try:
+            return _fetch_finnhub(symbol, fh_key)
+        except Exception as e:
+            errors.append(f"Finnhub: {str(e)[:60]}")
+
+    # All failed — raise so error is NOT cached
+    raise RuntimeError(" | ".join(errors))
+
+
+def fetch_stock(symbol: str, av_key: str = "", fh_key: str = "") -> dict:
+    """
+    Public fetch function — wraps cached version so errors are never cached.
+    On failure returns error dict immediately (no stale cache of failures).
+    """
+    try:
+        return _fetch_stock_cached(symbol, av_key, fh_key)
+    except Exception as e:
+        result = _empty_result(symbol)
+        result["error"] = str(e)
+        return result
 
 # ── VALUATION SCORING ─────────────────────────────────────────────────────────
 def score_stock(d: dict) -> dict:
@@ -1012,7 +1188,45 @@ def chart_fcf_comparison(stocks_data: list):
 # ── RENDER FUNCTIONS ──────────────────────────────────────────────────────────
 def render_stock_card(d: dict):
     if d.get("error"):
-        st.error(f"❌ {d['symbol']} 數據獲取失敗：{d['error']}")
+        err_msg = str(d.get("error") or "")
+        # Treat ALL yfinance / network errors as rate-limit (most common cause on Streamlit Cloud)
+        _rl_keywords = ["rate", "429", "too many", "yfratelimit", "limit", "empty info",
+                        "runtimeerror", "yfinance"]
+        is_rate_limit = any(kw in err_msg.lower() for kw in _rl_keywords) or not err_msg
+        sym = d["symbol"]
+        if is_rate_limit:
+            st.markdown(f"""
+            <div style="background:#fff9ee;border:1px solid #d4c4a8;border-left:4px solid #c8922a;
+                        border-radius:6px;padding:16px 20px;margin-bottom:12px;">
+              <div style="font-family:IBM Plex Mono,monospace;font-size:12px;
+                          color:#c8922a;font-weight:600;margin-bottom:8px">
+                ⚠️ {sym} — 數據源被限速
+              </div>
+              <div style="font-size:13px;color:#3d2b1f;line-height:1.8">
+                Streamlit Cloud 的共享 IP 被 Yahoo Finance 封鎖，這是雲端部署的常見問題。<br>
+                <b>解決方法：</b>在左側欄填入免費 API Key，系統自動切換數據源：
+              </div>
+              <div style="margin-top:10px;display:flex;gap:12px;flex-wrap:wrap">
+                <a href="https://www.alphavantage.co/support/#api-key" target="_blank"
+                   style="background:#2a1d13;color:#e8b84b;padding:7px 14px;border-radius:4px;
+                          text-decoration:none;font-family:IBM Plex Mono,monospace;font-size:11px;
+                          font-weight:600">
+                  🔑 免費申請 Alpha Vantage Key
+                </a>
+                <a href="https://finnhub.io/register" target="_blank"
+                   style="background:#2a1d13;color:#e8b84b;padding:7px 14px;border-radius:4px;
+                          text-decoration:none;font-family:IBM Plex Mono,monospace;font-size:11px;
+                          font-weight:600">
+                  🔑 免費申請 Finnhub Key
+                </a>
+              </div>
+              <div style="margin-top:8px;font-size:11px;color:#9a8a7a;font-family:IBM Plex Mono,monospace">
+                技術細節：{err_msg[:100]}
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.warning(f"⚠️ {sym} 數據異常：{err_msg[:150]}")
         return
 
     sc    = score_stock(d)
@@ -1032,8 +1246,12 @@ def render_stock_card(d: dict):
         <div>
           <div class="ticker-name">{d['symbol']}</div>
           <div class="company-name">{d['name'][:35]}</div>
-          <div style="margin-top:6px">
+          <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
             <span class="signal-badge {sc['sig_class']}">{sc['emoji']} {sc['signal']}　{sc['score']}/100</span>
+            <span style="font-family:IBM Plex Mono,monospace;font-size:9px;color:#9a8a7a;
+                         background:#f0ebe0;padding:2px 7px;border-radius:10px">
+              via {d.get('data_source','—')}
+            </span>
           </div>
         </div>
         <div class="price-block">
@@ -1387,6 +1605,12 @@ def main():
                 "⏸ 停止" if st.session_state.auto_refresh else "▶ 自動",
                 use_container_width=True
             )
+        # Clear cache button — forces re-fetch bypassing any cached errors
+        if st.button("🗑️ 清除 Cache 重試", use_container_width=True,
+                     help="如果數據顯示錯誤，點此清除舊 cache 重新拉取"):
+            _fetch_stock_cached.clear()
+            st.session_state.stock_data = {}
+            st.rerun()
 
         refresh_interval = st.selectbox("自動刷新間隔", [30, 60, 120, 300],
                                          format_func=lambda x: f"{x}秒", index=1)
@@ -1397,12 +1621,28 @@ def main():
 
         st.markdown("---")
         st.markdown("### 🔑 API 設定")
+
+        def _secret(key, default=""):
+            try: return st.secrets.get(key, default)
+            except: return default
+
+        st.markdown("**📊 股票數據（四層 Fallback）**")
+        av_key   = st.text_input("Alpha Vantage Key（Layer 2）", type="password",
+                                  value=_secret("ALPHA_VANTAGE_KEY"),
+                                  help="免費申請：alphavantage.co — 每日25次")
+        fh_key   = st.text_input("Finnhub Key（Layer 3）", type="password",
+                                  value=_secret("FINNHUB_KEY"),
+                                  help="免費申請：finnhub.io — 每分鐘60次")
+        st.caption("💡 Layer 1 (yfinance) 自動嘗試，雲端被封時自動切換")
+
+        st.markdown("**🤖 AI 分析**")
         groq_key  = st.text_input("Groq API Key", type="password",
-                                   value=st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else "")
-        tg_token  = st.text_input("Telegram Bot Token", type="password",
-                                   value=st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else "")
-        tg_chat   = st.text_input("Telegram Chat ID",
-                                   value=st.secrets.get("TELEGRAM_CHAT_ID", "") if hasattr(st, "secrets") else "")
+                                   value=_secret("GROQ_API_KEY"))
+        st.markdown("**📬 Telegram**")
+        tg_token  = st.text_input("Bot Token", type="password",
+                                   value=_secret("TELEGRAM_BOT_TOKEN"))
+        tg_chat   = st.text_input("Chat ID",
+                                   value=_secret("TELEGRAM_CHAT_ID"))
 
         st.markdown("---")
         st.markdown("### 📡 Telegram 警報")
@@ -1425,7 +1665,7 @@ def main():
     if need_refresh:
         with st.spinner("📡 正在拉取最新數據..."):
             for sym in symbols:
-                st.session_state.stock_data[sym] = fetch_stock(sym)
+                st.session_state.stock_data[sym] = fetch_stock(sym, av_key=av_key, fh_key=fh_key)
         st.session_state.last_refresh = datetime.now()
         st.session_state.tg_sent = set()  # reset alerts on refresh
 
