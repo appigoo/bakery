@@ -465,36 +465,9 @@ def _fetch_yfinance(symbol: str) -> dict:
                     "surprise_pct": round((actual - estimate) / abs(estimate) * 100, 1),
                 })
 
-    # Build quarterly TTM EPS + price history for EPS vs Price chart
-    try:
-        q_earn_full = tk.quarterly_earnings
-        hist_mth    = tk.history(period="5y", interval="1mo")
-        hist_px     = hist_mth["Close"].dropna() if not hist_mth.empty else pd.Series(dtype=float)
-
-        if q_earn_full is not None and not q_earn_full.empty and not hist_px.empty:
-            q_earn_full = q_earn_full.sort_index()
-            eps_vals_f  = q_earn_full.get("Earnings", pd.Series(dtype=float))
-            for date, px in hist_px.items():
-                prior = eps_vals_f[eps_vals_f.index <= date]
-                if len(prior) >= 4:
-                    ttm_eps = prior.iloc[-4:].sum()
-                    if ttm_eps and ttm_eps > 0 and px > 0:
-                        hist_eps.append({
-                            "date":    date,
-                            "eps_ttm": round(float(ttm_eps), 4),
-                            "price":   round(float(px), 2),
-                        })
-        elif trailing_eps and trailing_eps > 0 and not hist_px.empty:
-            # fallback: constant EPS across history (less accurate)
-            for date, px in hist_px.items():
-                if px > 0:
-                    hist_eps.append({
-                        "date":    date,
-                        "eps_ttm": round(float(trailing_eps), 4),
-                        "price":   round(float(px), 2),
-                    })
-    except Exception:
-        hist_eps = []
+    # hist_eps is derived later from hist_pe (price / pe = eps_implied)
+    # No extra API call needed — see derive_hist_eps()
+    hist_eps = []
 
     result = _empty_result(symbol)
     result.update({
@@ -1338,14 +1311,38 @@ def chart_pe_price_relationship(hist_pe: list, symbol: str, current_pe: float, c
     return fig1, None
 
 
+def _derive_eps_from_hist_pe(hist_pe: list) -> list:
+    """
+    Derive implied EPS from hist_pe records: eps_implied = price / pe.
+    This is mathematically exact and works without any extra API calls.
+    hist_pe records already contain both 'price' and 'pe'.
+    """
+    result = []
+    for rec in hist_pe:
+        pe  = rec.get("pe")
+        px  = rec.get("price")
+        dt  = rec.get("date")
+        if pe and px and pe > 0 and px > 0 and dt is not None:
+            result.append({
+                "date":    dt,
+                "eps_ttm": round(float(px) / float(pe), 4),
+                "price":   round(float(px), 2),
+            })
+    return result
+
+
 def chart_eps_price(hist_eps: list, symbol: str,
-                    current_eps: float, current_price: float) -> tuple:
+                    current_eps: float, current_price: float,
+                    hist_pe: list = None) -> tuple:
     """
-    Returns (fig_dual, fig_scatter, fig_growth):
-    fig_dual    — top: price history, bottom: TTM EPS history (dual-panel)
-    fig_scatter — EPS vs Price scatter with regression + current marker
-    fig_growth  — EPS YoY growth rate bars
+    Returns (fig_dual, fig_scatter, fig_growth).
+    If hist_eps is empty but hist_pe is provided, derives EPS as price/PE.
+    eps_implied = price ÷ PE — mathematically exact, no extra API needed.
     """
+    # Derive from hist_pe if hist_eps is empty (rate-limited fallback)
+    if (not hist_eps or len(hist_eps) < 6) and hist_pe and len(hist_pe) >= 6:
+        hist_eps = _derive_eps_from_hist_pe(hist_pe)
+
     if not hist_eps or len(hist_eps) < 6:
         return None, None, None
 
@@ -1376,7 +1373,7 @@ def chart_eps_price(hist_eps: list, symbol: str,
         shared_xaxes=True,
         row_heights=[0.52, 0.48],
         vertical_spacing=0.07,
-        subplot_titles=("股價走勢 Price", "TTM 每股盈餘 EPS")
+        subplot_titles=("股價走勢 Price", "每股盈餘 EPS（隱含值 = 股價 ÷ P/E）")
     )
 
     # Row 1: Price
@@ -1507,7 +1504,7 @@ def chart_eps_price(hist_eps: list, symbol: str,
         ))
 
     fig2.update_layout(
-        title=f"{symbol}  TTM EPS vs 股價 散點圖（EPS 增長帶動股價上升）",
+        title=f"{symbol}  隱含 EPS vs 股價 散點圖（EPS 增長帶動股價上升）",
         height=370,
         paper_bgcolor=CHART_THEME["paper_bgcolor"],
         plot_bgcolor=CHART_THEME["plot_bgcolor"],
@@ -1540,7 +1537,7 @@ def chart_eps_price(hist_eps: list, symbol: str,
                        annotation_position="right",
                        annotation_font=dict(size=9, color="#c8922a"))
         fig3.update_layout(
-            title=f"{symbol}  EPS 同比增長率（YoY %）",
+            title=f"{symbol}  EPS 隱含同比增長率（YoY %）",
             height=300,
             paper_bgcolor=CHART_THEME["paper_bgcolor"],
             plot_bgcolor=CHART_THEME["plot_bgcolor"],
@@ -2243,14 +2240,16 @@ def main():
             with ctab4:
                 hist_eps_data = sel_d.get("hist_eps", [])
                 cur_eps       = sel_d.get("eps")
+                # Pass hist_pe as fallback — derives eps_implied = price / pe
                 fig_ep1, fig_ep2, fig_ep3 = chart_eps_price(
-                    hist_eps_data, sel_sym, cur_eps, sel_px
+                    hist_eps_data, sel_sym, cur_eps, sel_px,
+                    hist_pe=sel_d.get("hist_pe", [])
                 )
                 if fig_ep1:
                     st.plotly_chart(fig_ep1, use_container_width=True,
                                     key=f"eps_dual_{sel_sym}")
                     st.caption(
-                        "📊 上圖：股價走勢　|　下圖：TTM EPS（棒顏色 = YoY增長速度）"
+                        "📊 上圖：股價走勢　|　下圖：隱含 EPS（= 股價 ÷ P/E，棒顏色 = YoY增長速度）"
                         "　🟢深綠 ≥+15%　🟢淺綠 +5%~15%　🟡 +0%~5%　🟠 -10%~0%　🔴 < -10%"
                     )
                 if fig_ep2:
@@ -2270,7 +2269,7 @@ def main():
                                     key=f"eps_growth_{sel_sym}")
                     st.caption("📊 EPS 同比增長率（YoY%）— 連續正增長代表盈利質素穩定")
                 if not fig_ep1 and not fig_ep2:
-                    st.info("暫無足夠 EPS 歷史數據（需要 yfinance 數據源且有季度盈利記錄）")
+                    st.info("暫無足夠歷史 P/E 數據來推算 EPS（需至少6個月的 P/E 記錄）")
 
             # Scoring reasons (always show)
             sc = score_stock(sel_d)
@@ -2477,7 +2476,10 @@ def main():
                 # EPS vs Price charts
                 h_eps_t4 = d.get("hist_eps", [])
                 if h_eps_t4:
-                    fe1, fe2, fe3 = chart_eps_price(h_eps_t4, sym_k, c_pe and d.get("eps"), c_px)
+                    fe1, fe2, fe3 = chart_eps_price(
+                    h_eps_t4, sym_k, d.get("eps"), c_px,
+                    hist_pe=d.get("hist_pe", [])
+                )
                     if fe1:
                         st.plotly_chart(fe1, use_container_width=True,
                                         key=f"eps_dual_{sym_k}_t4")
