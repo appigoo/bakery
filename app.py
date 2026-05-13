@@ -2023,7 +2023,8 @@ def _eps_price_widget_html(d: dict) -> str:
         r["mid"] = round((r["lo"] + r["hi"]) / 2, 1)
 
     # ── Build rows for non-TSLA stocks ───────────────────────────────────────
-    def build_rows_from_hist(src_list, src_type):
+    def build_rows_from_av_eps(src_list):
+        """Build rows from Alpha Vantage true quarterly EPS data."""
         rows = []
         seen = set()
         mo_to_q = {"1":"Q1","2":"Q1","3":"Q1","4":"Q2","5":"Q2","6":"Q2",
@@ -2031,52 +2032,99 @@ def _eps_price_widget_html(d: dict) -> str:
         for rec in sorted(src_list, key=lambda x: str(x.get("date",""))):
             dt = str(rec.get("date",""))[:7]
             if len(dt) < 7: continue
-            mo  = dt[5:7].lstrip("0") or "0"
-            qtr = mo_to_q.get(mo, "Q?")
-            q_key = dt[:4] + " " + qtr
+            mo    = dt[5:7].lstrip("0") or "0"
+            q_key = dt[:4] + " " + mo_to_q.get(mo, "Q?")
             if q_key in seen: continue
             seen.add(q_key)
-
-            if src_type == "eps":
-                eps_ttm = rec.get("eps_ttm", 0)
-                px      = rec.get("price", 0)
-                eps_q   = round(eps_ttm / 4, 3)
-                narrative = "真實季度 EPS (Alpha Vantage)"
-                reaction  = f"TTM ${eps_ttm:.2f}"
-            else:  # pe-derived
-                pe  = rec.get("pe", 0) or 0
-                px  = rec.get("price", 0) or 0
-                if not (pe > 0 and px > 0): continue
-                eps_q = round(px / pe / 4, 3)
-                narrative = "由 P/E 歷史推算（估算）"
-                reaction  = f"P/E {pe:.1f}x"
-
-            mkt = "bull" if eps_q > 0 else "bear"
+            eps_ttm = rec.get("eps_ttm", 0)
+            px      = rec.get("price", 0)
+            eps_q   = round(eps_ttm / 4, 3)
             rows.append({
                 "q": q_key, "eps": eps_q,
-                "lo": round(px * 0.92, 1), "hi": round(px * 1.08, 1), "mid": round(px, 1),
-                "mkt": mkt, "narrative": narrative, "reaction": reaction, "turn": False,
+                "lo": round(px*0.92,1), "hi": round(px*1.08,1), "mid": round(px,1),
+                "mkt": "bull" if eps_q>0 else "bear",
+                "narrative": "Alpha Vantage 真實數據",
+                "reaction": f"TTM ${eps_ttm:.2f}", "turn": False,
+            })
+        return rows
+
+    def build_rows_price_only(hist_pe_list, eps_surprise_list):
+        """
+        Build rows using REAL quarterly EPS from eps_surprise (past 4Q)
+        + price history from hist_pe. Does NOT derive EPS from P/E
+        (that causes circular flat values). For quarters without real EPS,
+        shows price trend only (eps=None rendered as gap in chart).
+        """
+        mo_to_q = {"1":"Q1","2":"Q1","3":"Q1","4":"Q2","5":"Q2","6":"Q2",
+                   "7":"Q3","8":"Q3","9":"Q3","10":"Q4","11":"Q4","12":"Q4"}
+
+        # Build real EPS lookup from eps_surprise {quarter_str -> actual_eps}
+        # eps_surprise quarter format: "2024-09" or "2024Q3" etc
+        real_eps = {}
+        for rec in (eps_surprise_list or []):
+            q_raw = str(rec.get("quarter",""))[:7]  # "YYYY-MM"
+            if len(q_raw) >= 7:
+                mo  = q_raw[5:7].lstrip("0") or "0"
+                q_k = q_raw[:4] + " " + mo_to_q.get(mo, "Q?")
+                actual = rec.get("actual")
+                if actual is not None:
+                    real_eps[q_k] = round(float(actual), 3)
+
+        # Build price rows from hist_pe (sampled quarterly)
+        rows = []
+        seen = set()
+        for rec in sorted(hist_pe_list, key=lambda x: str(x.get("date",""))):
+            dt = str(rec.get("date",""))[:7]
+            if len(dt) < 7: continue
+            mo    = dt[5:7].lstrip("0") or "0"
+            q_key = dt[:4] + " " + mo_to_q.get(mo, "Q?")
+            if q_key in seen: continue
+            seen.add(q_key)
+            px  = rec.get("price", 0)
+            if not px: continue
+
+            # Use real EPS if available for this quarter, else None
+            eps_real = real_eps.get(q_key)
+            narrative = "真實季度 EPS" if eps_real is not None else "股價數據（EPS 待補充）"
+            reaction  = f"實際 EPS ${eps_real:.2f}" if eps_real is not None else f"P/E {rec.get('pe',0):.1f}x"
+            mkt       = ("bull" if eps_real > 0 else "bear") if eps_real is not None else "neu"
+
+            rows.append({
+                "q": q_key,
+                "eps": eps_real,          # None = no bar shown in chart
+                "lo": round(px*0.92,1), "hi": round(px*1.08,1), "mid": round(px,1),
+                "mkt": mkt,
+                "narrative": narrative, "reaction": reaction, "turn": False,
             })
 
-        # Mark turning points
-        for i in range(1, len(rows)):
-            prev, curr = rows[i-1]["eps"], rows[i]["eps"]
+        # Mark turning points only where real EPS exists
+        real_rows = [r for r in rows if r["eps"] is not None]
+        for i in range(1, len(real_rows)):
+            prev, curr = real_rows[i-1]["eps"], real_rows[i]["eps"]
             if (prev < 0 <= curr) or (curr < 0 <= prev):
-                rows[i]["turn"] = True
-            elif prev != 0 and abs(curr - prev) / abs(prev) > 0.4:
-                rows[i]["turn"] = True
+                real_rows[i]["turn"] = True
+            elif prev != 0 and abs(curr-prev)/abs(prev) > 0.4:
+                real_rows[i]["turn"] = True
         return rows
+
+    eps_surprise = d.get("eps_surprise", [])
 
     # ── Select data source ────────────────────────────────────────────────────
     if sym == "TSLA":
         rows = TSLA_DATA
         data_src_note = "數據來源：Tesla SEC 8-K 財報（2016–2026）· 拆股後調整 · 本頁僅供教育用途"
     elif hist_eps and len(hist_eps) >= 6:
-        rows = build_rows_from_hist(hist_eps, "eps")
+        rows = build_rows_from_av_eps(hist_eps)
         data_src_note = f"數據來源：Alpha Vantage EARNINGS 端點（真實季度盈利）· {sym}"
     elif hist_pe and len(hist_pe) >= 6:
-        rows = build_rows_from_hist(hist_pe, "pe")
-        data_src_note = f"數據來源：P/E 歷史推算（估算值，非真實季度 EPS）· {sym} · 如需真實數據請填入 Alpha Vantage Key"
+        # Use real eps_surprise EPS for recent quarters + price history
+        # Never derive EPS from P/E — that creates circular flat values
+        rows = build_rows_price_only(hist_pe, eps_surprise)
+        n_real = sum(1 for r in rows if r.get("eps") is not None)
+        data_src_note = (
+            f"數據來源：股價來自 yfinance 歷史數據 · 近期 {n_real} 季 EPS 來自真實報告 · "
+            f"如需完整 EPS 歷史請填入 Alpha Vantage Key · {sym}"
+        )
     else:
         rows = [{"q":"現在","eps":round(cur_eps/4,3),"lo":round(cur_px*0.92,1),
                  "hi":round(cur_px*1.08,1),"mid":round(cur_px,1),
@@ -2263,10 +2311,11 @@ function buildChart(data) {{
       datasets: [
         {{
           type:'bar', label:'EPS',
-          data: data.map(r=>r.eps),
-          backgroundColor: data.map(r=>r.eps>=0?'rgba(151,196,89,0.85)':'rgba(226,75,74,0.82)'),
-          borderColor:     data.map(r=>r.eps>=0?'#639922':'#A32D2D'),
+          data: data.map(r=>r.eps!==null && r.eps!==undefined ? r.eps : null),
+          backgroundColor: data.map(r=>r.eps===null||r.eps===undefined?'transparent':r.eps>=0?'rgba(151,196,89,0.85)':'rgba(226,75,74,0.82)'),
+          borderColor:     data.map(r=>r.eps===null||r.eps===undefined?'transparent':r.eps>=0?'#639922':'#A32D2D'),
           borderWidth:0.5, borderRadius:3,
+          skipNull:true,
           yAxisID:'yE', order:2,
         }},
         {{
@@ -2338,15 +2387,17 @@ function buildTable(data) {{
   const maxMid = Math.max(...data.map(r=>r.mid), 1);
   document.getElementById('rcnt').textContent = data.length;
   document.getElementById('tb').innerHTML = data.map(r=>{{
-    const epsCls  = r.eps>=0?'pos':'neg';
-    const epsSign = r.eps>=0?'+':'';
+    const hasEps  = r.eps !== null && r.eps !== undefined;
+    const epsCls  = hasEps ? (r.eps>=0?'pos':'neg') : 'neu';
+    const epsSign = hasEps && r.eps>=0 ? '+' : '';
+    const epsTxt  = hasEps ? `${{epsSign}}$${{r.eps.toFixed(2)}}` : '<span style="color:#b0a090">—</span>';
     const bc      = MKT_CLS[r.mkt]||'b-neu';
     const bt      = MKT_TXT[r.mkt]||r.mkt;
     const bw      = Math.round(r.mid/maxMid*100);
-    const bc2     = r.eps>=0?'#97C459':'#E24B4A';
+    const bc2     = hasEps ? (r.eps>=0?'#97C459':'#E24B4A') : '#d4c4a8';
     return `<tr class="${{r.turn?'turn-row':''}}">
       <td class="qcell">${{r.q}}${{r.turn?'<span class="turn-tag">轉折</span>':''}}</td>
-      <td class="eps-cell ${{epsCls}}">${{epsSign}}$${{r.eps.toFixed(2)}}</td>
+      <td class="eps-cell ${{epsCls}}">${{epsTxt}}</td>
       <td class="range-cell">$${{r.lo}}–$${{r.hi}}</td>
       <td><div class="mid-cell">
         <span class="mid-num">$${{r.mid}}</span>
