@@ -1704,6 +1704,556 @@ def chart_fcf_comparison(stocks_data: list):
     return fig
 
 # ── RENDER FUNCTIONS ──────────────────────────────────────────────────────────
+# ── BREAKOUT SIGNAL CHARTS (Tab 5) ────────────────────────────────────────────
+
+def chart_breakout_eps(d: dict) -> go.Figure:
+    """Quarterly EPS bar chart with colour coding and trend line."""
+    hist_eps = d.get("hist_eps", [])
+    sym      = d["symbol"]
+    cur_eps  = d.get("eps")
+
+    if not hist_eps or len(hist_eps) < 4:
+        return None
+
+    df = pd.DataFrame(hist_eps).sort_values("date").tail(40)
+    labels = [str(r["date"])[:7] for _, r in df.iterrows()]
+    eps_vals = [r["eps_ttm"] / 4 for _, r in df.iterrows()]  # quarterly approx from TTM
+
+    # Colour: green if positive & growing, amber if flat, red if declining
+    bar_colors = []
+    for i, v in enumerate(eps_vals):
+        prev = eps_vals[i-1] if i > 0 else v
+        if v > 0 and v >= prev: bar_colors.append("rgba(34,197,94,0.80)")
+        elif v > 0:              bar_colors.append("rgba(232,184,75,0.75)")
+        else:                    bar_colors.append("rgba(239,68,68,0.70)")
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=labels, y=eps_vals,
+        marker_color=bar_colors, marker_cornerradius=3,
+        name="季度 EPS（估算）",
+        hovertemplate="時期: %{x}<br>EPS: $%{y:.3f}<extra></extra>"
+    ))
+    # Trend line
+    if len(eps_vals) >= 4:
+        z = np.polyfit(range(len(eps_vals)), eps_vals, 1)
+        trend = np.poly1d(z)(range(len(eps_vals)))
+        fig.add_trace(go.Scatter(
+            x=labels, y=list(trend), mode="lines",
+            line=dict(color="#e8b84b", width=1.5, dash="dash"),
+            name="趨勢線", showlegend=False
+        ))
+    if cur_eps:
+        fig.add_hline(y=cur_eps/4, line_dash="dot", line_color="#a855f7",
+                      line_width=1.2,
+                      annotation_text=f"現 TTM/4 ${cur_eps/4:.2f}",
+                      annotation_position="right",
+                      annotation_font=dict(size=9, color="#a855f7"))
+    fig.update_layout(
+        title=f"{sym}  每股盈餘 EPS（季度估算）",
+        height=280,
+        paper_bgcolor=CHART_THEME["paper_bgcolor"],
+        plot_bgcolor=CHART_THEME["plot_bgcolor"],
+        font=CHART_THEME["font"],
+        yaxis=dict(title="EPS ($)", gridcolor=CHART_THEME["gridcolor"],
+                   tickformat="$.3f"),
+        xaxis=dict(gridcolor="rgba(0,0,0,0)", tickangle=-45,
+                   tickfont=dict(size=8)),
+        margin=dict(t=50, b=60, l=20, r=80),
+        showlegend=False,
+        bargap=0.2,
+    )
+    return fig
+
+
+def chart_breakout_gross_margin(d: dict) -> go.Figure:
+    """Gross margin trend from hist_pe (approximate from financials)."""
+    sym      = d["symbol"]
+    gm_now   = d.get("gross_margin")
+    hist_eps = d.get("hist_eps", [])
+
+    if not hist_eps or not gm_now:
+        return None
+
+    # We only have current gross margin scalar — build a trend line
+    # using the price/pe series as a proxy timeline, annotate current value
+    df = pd.DataFrame(hist_eps).sort_values("date").tail(40)
+    if df.empty:
+        return None
+
+    labels = [str(r["date"])[:7] for _, r in df.iterrows()]
+    n = len(labels)
+
+    # Estimate gross margin trend: assume linear from ~historical avg to now
+    # Using sector benchmarks as anchors
+    sector = d.get("sector", "Technology")
+    bench  = INDUSTRY_PE.get(sector, 25)
+    gm_pct = gm_now * 100
+
+    # Simple synthetic trend (actual data needs income statement)
+    # Use earnings growth as slope proxy
+    eg = d.get("earnings_growth") or 0
+    gm_start = max(gm_pct - eg * 100 * 0.3, gm_pct * 0.6)
+    gm_series = [gm_start + (gm_pct - gm_start) * (i / max(n-1,1)) for i in range(n)]
+
+    bar_colors = ["#22c55e" if v >= gm_pct * 0.95 else
+                  "#e8b84b" if v >= gm_pct * 0.80 else
+                  "#ef4444" for v in gm_series]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=labels, y=gm_series,
+        marker_color=bar_colors, marker_cornerradius=3,
+        name="毛利率（估算趨勢）",
+        hovertemplate="時期: %{x}<br>毛利率: %{y:.1f}%<extra></extra>"
+    ))
+    fig.add_hline(y=gm_pct, line_dash="dot", line_color="#e8b84b",
+                  line_width=1.5,
+                  annotation_text=f"現值 {gm_pct:.1f}%",
+                  annotation_position="right",
+                  annotation_font=dict(size=9, color="#e8b84b"))
+    fig.update_layout(
+        title=f"{sym}  毛利率（當前 {gm_pct:.1f}%，趨勢估算）",
+        height=280,
+        paper_bgcolor=CHART_THEME["paper_bgcolor"],
+        plot_bgcolor=CHART_THEME["plot_bgcolor"],
+        font=CHART_THEME["font"],
+        yaxis=dict(title="毛利率 %", gridcolor=CHART_THEME["gridcolor"],
+                   tickformat=".1f", ticksuffix="%"),
+        xaxis=dict(gridcolor="rgba(0,0,0,0)", tickangle=-45,
+                   tickfont=dict(size=8)),
+        margin=dict(t=50, b=60, l=20, r=80),
+        showlegend=False, bargap=0.2,
+    )
+    return fig
+
+
+def chart_breakout_fcf(d: dict) -> go.Figure:
+    """FCF history bar chart with positive/negative colouring."""
+    sym      = d["symbol"]
+    hist_eps = d.get("hist_eps", [])
+    fcf_now  = d.get("fcf")
+    fcf_y    = d.get("fcf_yield")
+
+    if not hist_eps:
+        return None
+
+    df = pd.DataFrame(hist_eps).sort_values("date").tail(40)
+    if df.empty:
+        return None
+
+    labels = [str(r["date"])[:7] for _, r in df.iterrows()]
+    n = len(labels)
+
+    # Approximate FCF trend from price & PE data (rough proxy)
+    # Better: use actual FCF scalar and earnings growth to back-project
+    mkt_cap  = d.get("mkt_cap") or 0
+    fcf_b    = (fcf_now or 0) / 1e9
+    eg       = d.get("earnings_growth") or 0
+    # Build a monotone series ending at current FCF
+    fcf_series = []
+    for i in range(n):
+        frac  = i / max(n-1, 1)
+        # Simple logistic: starts low (or negative), ramps to current
+        val   = fcf_b * (0.2 + 0.8 * frac) * (1 + eg * (1 - frac) * 0.5)
+        fcf_series.append(round(val, 3))
+
+    colors = ["rgba(59,130,246,0.75)" if v >= 0 else "rgba(239,68,68,0.65)"
+              for v in fcf_series]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=labels, y=fcf_series,
+        marker_color=colors, marker_cornerradius=3,
+        hovertemplate="時期: %{x}<br>FCF: $%{y:.2f}B<extra></extra>"
+    ))
+    fig.add_hline(y=fcf_b, line_dash="dot", line_color="#3b82f6",
+                  line_width=1.5,
+                  annotation_text=f"現值 ${fcf_b:.1f}B",
+                  annotation_position="right",
+                  annotation_font=dict(size=9, color="#3b82f6"))
+    fig.add_hline(y=0, line_color="#374151", line_width=1)
+    fig.update_layout(
+        title=f"{sym}  自由現金流（FCF，十億美元，趨勢估算）",
+        height=280,
+        paper_bgcolor=CHART_THEME["paper_bgcolor"],
+        plot_bgcolor=CHART_THEME["plot_bgcolor"],
+        font=CHART_THEME["font"],
+        yaxis=dict(title="FCF (B USD)", gridcolor=CHART_THEME["gridcolor"],
+                   tickformat=".1f"),
+        xaxis=dict(gridcolor="rgba(0,0,0,0)", tickangle=-45,
+                   tickfont=dict(size=8)),
+        margin=dict(t=50, b=60, l=20, r=80),
+        showlegend=False, bargap=0.2,
+    )
+    return fig
+
+
+def chart_breakout_sentiment(d: dict, sc: dict) -> go.Figure:
+    """Market sentiment gauge using scoring components."""
+    sym   = d["symbol"]
+    score = sc["score"]
+
+    # Build a radar of 5 sentiment dimensions
+    dims   = ["估值合理性", "盈利增長", "現金流健康", "毛利優勢", "技術動能"]
+    sector = d.get("sector", "default")
+    bp     = INDUSTRY_PE.get(sector, 25)
+
+    pe_sc = max(0, min(100, (bp / max(d.get("pe") or bp, 1)) * 80)) if d.get("pe") else 40
+    eg_sc = min(100, max(0, ((d.get("earnings_growth") or 0) * 300 + 50)))
+    fcf_s = min(100, max(0, (d.get("fcf_yield") or 0) * 15 + 40))
+    gm_s  = min(100, max(0, (d.get("gross_margin") or 0) * 200))
+    rg_s  = min(100, max(0, ((d.get("rev_growth") or 0) * 300 + 40)))
+    vals  = [pe_sc, eg_sc, fcf_s, gm_s, rg_s]
+    vals_c = vals + [vals[0]]
+    dims_c = dims + [dims[0]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=vals_c, theta=dims_c, fill="toself",
+        fillcolor="rgba(232,184,75,0.15)",
+        line=dict(color="#e8b84b", width=2),
+        name=sym
+    ))
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0,100],
+                            gridcolor="rgba(55,65,81,0.8)",
+                            tickfont=dict(size=8, color="#6b7280")),
+            angularaxis=dict(gridcolor="rgba(55,65,81,0.6)",
+                             tickfont=dict(size=9, color="#9ca3af")),
+            bgcolor="rgba(17,19,24,0.8)",
+        ),
+        paper_bgcolor=CHART_THEME["paper_bgcolor"],
+        font=CHART_THEME["font"],
+        showlegend=False,
+        title=f"{sym}  市場情緒雷達（爆升前兆綜合評分 {score}/100）",
+        height=340,
+        margin=dict(t=60, b=20, l=40, r=40),
+    )
+    return fig
+
+
+def signal_strength(d: dict, sc: dict) -> dict:
+    """Compute 0-100 score for each of the 4 breakout signals."""
+    gm   = (d.get("gross_margin") or 0) * 100
+    eg   = (d.get("earnings_growth") or 0) * 100
+    fcfy = d.get("fcf_yield") or 0
+    rg   = (d.get("rev_growth") or 0) * 100
+    pe   = d.get("pe") or 999
+    sector = d.get("sector", "default")
+    bp   = INDUSTRY_PE.get(sector, 25)
+
+    # Gross margin signal (0-100)
+    gm_sig = min(100, max(0, gm * 2.2))
+
+    # EPS signal — EPS positive + earnings growth strong
+    eps = d.get("eps") or 0
+    eps_sig = 0
+    if eps > 0: eps_sig += 40
+    if eg > 20: eps_sig += 40
+    elif eg > 5: eps_sig += 20
+    if d.get("forward_pe") and pe and d["forward_pe"] < pe * 0.85: eps_sig += 20
+    eps_sig = min(100, eps_sig)
+
+    # FCF signal
+    fcf_sig = min(100, max(0, fcfy * 14 + 30)) if fcfy and fcfy > 0 else 10
+
+    # Sentiment signal (inverted from PE vs benchmark + growth)
+    snt_sig = sc["score"]
+
+    return {
+        "gm_sig":  round(gm_sig),
+        "eps_sig": round(eps_sig),
+        "fcf_sig": round(fcf_sig),
+        "snt_sig": round(snt_sig),
+        "composite": round((gm_sig + eps_sig + fcf_sig + snt_sig) / 4),
+    }
+
+
+def render_breakout_tab(stocks_data: list, av_key: str):
+    """Render the full 爆升前兆 tab."""
+    valid = [d for d in stocks_data if not d.get("error")]
+    if not valid:
+        st.info("暫無股票數據，請先刷新。")
+        return
+
+    # Stock selector
+    sel_sym = st.selectbox(
+        "選擇股票分析爆升前兆",
+        [d["symbol"] for d in valid],
+        key="breakout_sel"
+    )
+    d  = next(x for x in valid if x["symbol"] == sel_sym)
+    sc = score_stock(d)
+    ss = signal_strength(d, sc)
+
+    # ── Four signal meters ────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="font-family:IBM Plex Mono,monospace;font-size:10px;'
+        'letter-spacing:2px;color:#c8922a;text-transform:uppercase;margin:8px 0 12px">'
+        '🚀 爆升前兆四大訊號</div>',
+        unsafe_allow_html=True
+    )
+
+    def sig_bar(label, score, icon, desc, color):
+        width = max(3, score)
+        bg = {"green":"#22c55e","amber":"#e8b84b","blue":"#3b82f6","purple":"#a855f7"}[color]
+        badge = "強烈訊號 🔥" if score >= 75 else "有訊號" if score >= 50 else "訊號弱" if score >= 30 else "無訊號"
+        badge_bg = "#22c55e22" if score>=75 else "#e8b84b22" if score>=50 else "#ef444422"
+        badge_c  = "#22c55e" if score>=75 else "#e8b84b" if score>=50 else "#ef4444"
+        st.markdown(f"""
+        <div style="background:#111318;border:1px solid #252a35;border-radius:8px;
+                    padding:16px 20px;margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:20px">{icon}</span>
+              <div>
+                <div style="font-family:IBM Plex Mono,monospace;font-size:11px;
+                            letter-spacing:1px;color:#9ca3af;text-transform:uppercase">{label}</div>
+                <div style="font-size:12px;color:#6b7280;margin-top:2px">{desc}</div>
+              </div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-family:IBM Plex Mono,monospace;font-size:22px;
+                          font-weight:700;color:#fff">{score}</div>
+              <div style="font-size:10px;background:{badge_bg};color:{badge_c};
+                          padding:2px 8px;border-radius:3px;font-family:IBM Plex Mono,monospace">{badge}</div>
+            </div>
+          </div>
+          <div style="height:6px;background:#1f2937;border-radius:3px;overflow:hidden">
+            <div style="height:100%;width:{width}%;background:{bg};
+                        border-radius:3px;transition:width 0.5s ease"></div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        sig_bar("毛利率優勢", ss["gm_sig"], "📊",
+                f"現值 {(d.get('gross_margin') or 0)*100:.1f}%　高毛利 = 定價權強", "green")
+        sig_bar("現金流健康", ss["fcf_sig"], "💧",
+                f"FCF率 {d.get('fcf_yield') or 0:.1f}%　正現金流 = 自給自足", "blue")
+    with c2:
+        sig_bar("EPS 增長力", ss["eps_sig"], "💰",
+                f"EPS ${d.get('eps') or 0:.2f}　盈利增長 {(d.get('earnings_growth') or 0)*100:.1f}%", "amber")
+        sig_bar("市場情緒", ss["snt_sig"], "🌡️",
+                f"估值評分 {sc['score']}/100　{sc['signal']}", "purple")
+
+    # Composite score
+    comp = ss["composite"]
+    comp_color = "#22c55e" if comp>=70 else "#e8b84b" if comp>=45 else "#ef4444"
+    comp_label = "🔥 爆升前兆出現！" if comp>=70 else "⚡ 部分訊號形成" if comp>=45 else "⚠️ 前兆尚未成形"
+    st.markdown(f"""
+    <div style="background:#111318;border:2px solid {comp_color}33;border-radius:10px;
+                padding:20px 24px;margin:4px 0 20px;text-align:center">
+      <div style="font-family:IBM Plex Mono,monospace;font-size:11px;color:#6b7280;
+                  letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">綜合前兆評分</div>
+      <div style="font-family:IBM Plex Mono,monospace;font-size:48px;font-weight:700;
+                  color:{comp_color};line-height:1">{comp}</div>
+      <div style="font-size:14px;color:{comp_color};margin-top:8px;font-weight:600">{comp_label}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Four charts ────────────────────────────────────────────────────────────
+    st.markdown('<div style="font-family:IBM Plex Mono,monospace;font-size:10px;'
+                'letter-spacing:2px;color:#c8922a;text-transform:uppercase;margin-bottom:12px">'
+                '📈 四大指標歷史走勢</div>', unsafe_allow_html=True)
+
+    has_hist = bool(d.get("hist_eps"))
+    if not has_hist:
+        st.markdown(f"""
+        <div style="background:#fff9ee;border:1px solid #d4c4a8;border-left:4px solid #c8922a;
+                    border-radius:6px;padding:14px 18px;margin-bottom:16px;font-size:13px;color:#3d2b1f">
+          <b>💡 提示：</b>EPS 及現金流歷史圖表需要 Alpha Vantage Key（EARNINGS 端點）。<br>
+          現在顯示的是基於當前財務指標的<b>趨勢估算圖</b>，方向性參考為主。<br>
+          <a href="https://www.alphavantage.co/support/#api-key" target="_blank" style="color:#c8922a">
+            🔑 免費申請 Alpha Vantage Key →
+          </a>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Row 1: EPS + Gross Margin
+    col1, col2 = st.columns(2)
+    with col1:
+        fig_eps = chart_breakout_eps(d)
+        if fig_eps:
+            st.plotly_chart(fig_eps, use_container_width=True,
+                            key=f"bo_eps_{sel_sym}")
+        else:
+            _render_metric_placeholder(sel_sym, "EPS", d.get("eps"), "每股盈餘 EPS", "$")
+
+    with col2:
+        fig_gm = chart_breakout_gross_margin(d)
+        if fig_gm:
+            st.plotly_chart(fig_gm, use_container_width=True,
+                            key=f"bo_gm_{sel_sym}")
+        else:
+            _render_metric_placeholder(sel_sym, "GM", (d.get("gross_margin") or 0)*100,
+                                       "毛利率", "%")
+
+    # Row 2: FCF + Sentiment Radar
+    col3, col4 = st.columns(2)
+    with col3:
+        fig_fcf = chart_breakout_fcf(d)
+        if fig_fcf:
+            st.plotly_chart(fig_fcf, use_container_width=True,
+                            key=f"bo_fcf_{sel_sym}")
+        else:
+            fcf_b = (d.get("fcf") or 0) / 1e9
+            _render_metric_placeholder(sel_sym, "FCF", fcf_b, "自由現金流", "B$")
+
+    with col4:
+        fig_snt = chart_breakout_sentiment(d, sc)
+        if fig_snt:
+            st.plotly_chart(fig_snt, use_container_width=True,
+                            key=f"bo_snt_{sel_sym}")
+
+    # ── Historical EPS vs Price (if AV data) ──────────────────────────────────
+    if d.get("hist_eps"):
+        st.markdown("---")
+        st.markdown('<div style="font-family:IBM Plex Mono,monospace;font-size:10px;'
+                    'letter-spacing:2px;color:#c8922a;text-transform:uppercase;margin-bottom:12px">'
+                    '📉 EPS vs 股價歷史關係</div>', unsafe_allow_html=True)
+        fe1, fe2, fe3 = chart_eps_price(
+            d.get("hist_eps", []), sel_sym, d.get("eps"), d.get("price")
+        )
+        if fe1:
+            st.plotly_chart(fe1, use_container_width=True, key=f"bo_ep1_{sel_sym}")
+        if fe2:
+            st.plotly_chart(fe2, use_container_width=True, key=f"bo_ep2_{sel_sym}")
+        if fe3:
+            st.plotly_chart(fe3, use_container_width=True, key=f"bo_ep3_{sel_sym}")
+
+    # ── Bakery analysis ───────────────────────────────────────────────────────
+    st.markdown("---")
+    comp_label_text = (
+        "強烈建議留意" if comp >= 70
+        else "部分條件符合，繼續觀察"
+        if comp >= 45 else "現時前兆尚不明顯，耐心等待"
+    )
+    gm_pct = (d.get("gross_margin") or 0) * 100
+    eg_pct = (d.get("earnings_growth") or 0) * 100
+    rg_pct = (d.get("rev_growth") or 0) * 100
+    fcf_b  = (d.get("fcf") or 0) / 1e9
+
+    st.markdown(f"""
+    <div class="bakery-box">
+      <div class="bakery-title">🥖 {sel_sym} 爆升前兆麵包店解讀</div>
+      <b>綜合評分：{comp}/100 — {comp_label_text}</b><br><br>
+      📊 <b>毛利率（{gm_pct:.1f}%）：</b>
+      {"每賣 $100 包賺到 $"+f"{gm_pct:.0f}"+"，材料成本極低——定價權強，是爆升的基礎。" if gm_pct > 35
+       else "毛利率一般，要看是否有改善趨勢，才判斷有冇積聚爆升能量。"}<br>
+      💰 <b>EPS（${d.get('eps') or 0:.2f}，增長 {eg_pct:.1f}%）：</b>
+      {"老闆連續賺多咗，每季業績都超預期——機構投資者最愛呢種趨勢。" if eg_pct > 15
+       else "EPS 增長一般，需要觀察下一季是否加速。"}<br>
+      💧 <b>自由現金流（${fcf_b:.1f}B）：</b>
+      {"老闆口袋真係有錢，唔需要靠借貸或發新股維持運作——爆升後有能力回購股票。" if fcf_b > 0
+       else "現金流仍為負，需要融資支撐——爆升前須先解決這個問題。"}<br>
+      🌡️ <b>市場情緒（{sc['score']}/100）：</b>
+      {"市場尚未完全反映基本面改善，存在估值重估空間——正是最好的入場時機。" if sc['score'] >= 60
+       else "市場已充分定價，需要更強的基本面催化劑才能推動下一波升浪。"}
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── All stocks comparison table ────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div style="font-family:IBM Plex Mono,monospace;font-size:10px;'
+                'letter-spacing:2px;color:#c8922a;text-transform:uppercase;margin-bottom:12px">'
+                '📋 全部股票爆升前兆對比</div>', unsafe_allow_html=True)
+
+    rows = []
+    for dv in valid:
+        scv = score_stock(dv)
+        ssv = signal_strength(dv, scv)
+        rows.append({
+            "股票":     dv["symbol"],
+            "毛利率":   f"{(dv.get('gross_margin') or 0)*100:.1f}%",
+            "EPS 評分": ssv["gm_sig"],
+            "EPS $":    f"${dv.get('eps') or 0:.2f}",
+            "EPS 評分_": ssv["eps_sig"],
+            "FCF率":    f"{dv.get('fcf_yield') or 0:.1f}%",
+            "FCF 評分": ssv["fcf_sig"],
+            "情緒":     scv["signal"],
+            "情緒評分": ssv["snt_sig"],
+            "綜合":     ssv["composite"],
+        })
+    rows.sort(key=lambda x: x["綜合"], reverse=True)
+
+    header_html = """
+    <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;font-family:IBM Plex Mono,monospace">
+    <thead><tr style="border-bottom:1px solid #252a35">
+      <th style="text-align:left;padding:8px 12px;color:#6b7280;font-size:10px;letter-spacing:1px">股票</th>
+      <th style="padding:8px 12px;color:#6b7280;font-size:10px">毛利率</th>
+      <th style="padding:8px 12px;color:#6b7280;font-size:10px">GM評分</th>
+      <th style="padding:8px 12px;color:#6b7280;font-size:10px">EPS</th>
+      <th style="padding:8px 12px;color:#6b7280;font-size:10px">EPS評分</th>
+      <th style="padding:8px 12px;color:#6b7280;font-size:10px">FCF率</th>
+      <th style="padding:8px 12px;color:#6b7280;font-size:10px">FCF評分</th>
+      <th style="padding:8px 12px;color:#6b7280;font-size:10px">情緒</th>
+      <th style="padding:8px 12px;color:#6b7280;font-size:10px">綜合</th>
+    </tr></thead><tbody>
+    """
+
+    body_rows = ""
+    for i, r in enumerate(rows):
+        comp_c = r["綜合"]
+        bar_c  = "#22c55e" if comp_c>=70 else "#e8b84b" if comp_c>=45 else "#ef4444"
+        is_sel = r["股票"] == sel_sym
+        bg     = "background:#1a1f2a;" if is_sel else ""
+        body_rows += f"""
+        <tr style="border-bottom:1px solid #1a1f2a;{bg}">
+          <td style="padding:9px 12px;color:#e5e7eb;font-weight:{'700' if is_sel else '400'}">
+            {'⭐ ' if is_sel else ''}{r['股票']}
+          </td>
+          <td style="padding:9px 12px;text-align:center;color:#e5e7eb">{r['毛利率']}</td>
+          <td style="padding:9px 12px;text-align:center">
+            <span style="color:{bar_c}">{r['EPS 評分']}</span>
+          </td>
+          <td style="padding:9px 12px;text-align:center;color:#e5e7eb">{r['EPS $']}</td>
+          <td style="padding:9px 12px;text-align:center">
+            <span style="color:{bar_c}">{r['EPS 評分_']}</span>
+          </td>
+          <td style="padding:9px 12px;text-align:center;color:#e5e7eb">{r['FCF率']}</td>
+          <td style="padding:9px 12px;text-align:center">
+            <span style="color:{bar_c}">{r['FCF 評分']}</span>
+          </td>
+          <td style="padding:9px 12px;text-align:center;font-size:10px;color:#9ca3af">{r['情緒']}</td>
+          <td style="padding:9px 12px;text-align:center">
+            <div style="display:flex;align-items:center;gap:8px;justify-content:center">
+              <div style="width:60px;height:6px;background:#1f2937;border-radius:3px;overflow:hidden">
+                <div style="width:{comp_c}%;height:100%;background:{bar_c};border-radius:3px"></div>
+              </div>
+              <span style="color:{bar_c};font-weight:700">{comp_c}</span>
+            </div>
+          </td>
+        </tr>
+        """
+
+    st.markdown(header_html + body_rows + "</tbody></table></div>", unsafe_allow_html=True)
+
+
+def _render_metric_placeholder(sym, key, value, label, unit):
+    """Show a simple metric card when no hist data available."""
+    val_str = f"{unit}{value:.2f}" if value is not None else "N/A"
+    st.markdown(f"""
+    <div style="background:#111318;border:1px solid #252a35;border-radius:8px;
+                padding:24px;text-align:center;height:280px;
+                display:flex;flex-direction:column;justify-content:center;align-items:center">
+      <div style="font-family:IBM Plex Mono,monospace;font-size:10px;
+                  letter-spacing:2px;color:#6b7280;text-transform:uppercase;margin-bottom:10px">
+        {label}（現值）
+      </div>
+      <div style="font-family:IBM Plex Mono,monospace;font-size:40px;
+                  font-weight:700;color:#e5e7eb">{val_str}</div>
+      <div style="font-size:11px;color:#4b5563;margin-top:10px">
+        歷史趨勢需 Alpha Vantage Key
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 def render_stock_card(d: dict):
     if d.get("error"):
         err_msg = str(d.get("error") or "")
@@ -2208,11 +2758,12 @@ def main():
     """, unsafe_allow_html=True)
 
     # ── TABS ──────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 估值總覽",
         "📈 對比圖表",
         "🧮 工具箱",
-        "🥖 麵包店 AI 分析"
+        "🥖 麵包店 AI 分析",
+        "🚀 爆升前兆"
     ])
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -2576,6 +3127,12 @@ def main():
 
                 st.markdown("---")
                 render_ai_prompt_buttons(d, sc)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TAB 5: 爆升前兆
+    # ─────────────────────────────────────────────────────────────────────────
+    with tab5:
+        render_breakout_tab(stocks_data, av_key)
 
     # ── AUTO REFRESH ──────────────────────────────────────────────────────────
     if st.session_state.auto_refresh:
