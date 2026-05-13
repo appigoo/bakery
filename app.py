@@ -2521,10 +2521,20 @@ def render_breakout_tab(stocks_data: list, av_key: str):
         unsafe_allow_html=True
     )
     widget_html = _eps_price_widget_html(d)
-    # Height: KPI row + filters + chart + table rows (approx 40px each) + padding
-    n_rows = max(len(d.get("hist_eps", d.get("hist_pe", []))), 8)
-    widget_h = 560 + min(n_rows, 40) * 26
-    components.html(widget_html, height=widget_h, scrolling=False)
+    # Height: header(80) + KPI(90) + filters(40) + chart(320) + legend(36) +
+    #         thead(32) + rows(28px each) + datasrc(40) + padding(60)
+    # TSLA has 26 fixed rows; other stocks use hist_pe length
+    if sym == "TSLA":
+        n_data_rows = 26
+    elif d.get("hist_eps"):
+        n_data_rows = min(len(d["hist_eps"]), 60)
+    elif d.get("hist_pe"):
+        # hist_pe sampled quarterly ~= len/3
+        n_data_rows = min(len(d["hist_pe"]) // 3 + 2, 60)
+    else:
+        n_data_rows = 4
+    widget_h = 700 + n_data_rows * 30
+    components.html(widget_html, height=widget_h, scrolling=True)
 
     # ── Plotly EPS vs Price (if AV data — additional detail) ────────────────
     if d.get("hist_eps"):
@@ -2594,58 +2604,61 @@ def render_breakout_tab(stocks_data: list, av_key: str):
         })
     rows.sort(key=lambda x: x["綜合"], reverse=True)
 
-    header_html = """
-    <div style="overflow-x:auto">
-    <table style="width:100%;border-collapse:collapse;font-size:12px;font-family:IBM Plex Mono,monospace">
-    <thead><tr style="border-bottom:1px solid #252a35">
-      <th style="text-align:left;padding:8px 12px;color:#6b7280;font-size:10px;letter-spacing:1px">股票</th>
-      <th style="padding:8px 12px;color:#6b7280;font-size:10px">毛利率</th>
-      <th style="padding:8px 12px;color:#6b7280;font-size:10px">GM評分</th>
-      <th style="padding:8px 12px;color:#6b7280;font-size:10px">EPS</th>
-      <th style="padding:8px 12px;color:#6b7280;font-size:10px">EPS評分</th>
-      <th style="padding:8px 12px;color:#6b7280;font-size:10px">FCF率</th>
-      <th style="padding:8px 12px;color:#6b7280;font-size:10px">FCF評分</th>
-      <th style="padding:8px 12px;color:#6b7280;font-size:10px">情緒</th>
-      <th style="padding:8px 12px;color:#6b7280;font-size:10px">綜合</th>
-    </tr></thead><tbody>
-    """
-
-    body_rows = ""
-    for i, r in enumerate(rows):
+    # Build comparison table as components.html (avoids Streamlit markdown escaping)
+    tbl_rows_html = ""
+    for r in rows:
         comp_c = r["綜合"]
         bar_c  = "#22c55e" if comp_c>=70 else "#e8b84b" if comp_c>=45 else "#ef4444"
         is_sel = r["股票"] == sel_sym
-        bg     = "background:#1a1f2a;" if is_sel else ""
-        body_rows += f"""
-        <tr style="border-bottom:1px solid #1a1f2a;{bg}">
-          <td style="padding:9px 12px;color:#e5e7eb;font-weight:{'700' if is_sel else '400'}">
-            {'⭐ ' if is_sel else ''}{r['股票']}
-          </td>
-          <td style="padding:9px 12px;text-align:center;color:#e5e7eb">{r['毛利率']}</td>
-          <td style="padding:9px 12px;text-align:center">
-            <span style="color:{bar_c}">{r['EPS 評分']}</span>
-          </td>
-          <td style="padding:9px 12px;text-align:center;color:#e5e7eb">{r['EPS $']}</td>
-          <td style="padding:9px 12px;text-align:center">
-            <span style="color:{bar_c}">{r['EPS 評分_']}</span>
-          </td>
-          <td style="padding:9px 12px;text-align:center;color:#e5e7eb">{r['FCF率']}</td>
-          <td style="padding:9px 12px;text-align:center">
-            <span style="color:{bar_c}">{r['FCF 評分']}</span>
-          </td>
-          <td style="padding:9px 12px;text-align:center;font-size:10px;color:#9ca3af">{r['情緒']}</td>
-          <td style="padding:9px 12px;text-align:center">
+        bg     = "background:#fff9f0;" if is_sel else ""
+        star   = "⭐ " if is_sel else ""
+        fw     = "700" if is_sel else "400"
+        tbl_rows_html += f"""<tr style="border-bottom:1px solid #ece4d4;{bg}">
+          <td style="padding:8px 12px;color:#2a1d13;font-weight:{fw};font-family:'IBM Plex Mono',monospace">{star}{r['股票']}</td>
+          <td style="padding:8px 12px;text-align:center;color:#3d2b1f;font-family:'IBM Plex Mono',monospace">{r['毛利率']}</td>
+          <td style="padding:8px 12px;text-align:center;font-family:'IBM Plex Mono',monospace"><span style="color:{bar_c};font-weight:600">{r['EPS 評分']}</span></td>
+          <td style="padding:8px 12px;text-align:center;color:#3d2b1f;font-family:'IBM Plex Mono',monospace">{r['EPS $']}</td>
+          <td style="padding:8px 12px;text-align:center;font-family:'IBM Plex Mono',monospace"><span style="color:{bar_c};font-weight:600">{r['EPS 評分_']}</span></td>
+          <td style="padding:8px 12px;text-align:center;color:#3d2b1f;font-family:'IBM Plex Mono',monospace">{r['FCF率']}</td>
+          <td style="padding:8px 12px;text-align:center;font-family:'IBM Plex Mono',monospace"><span style="color:{bar_c};font-weight:600">{r['FCF 評分']}</span></td>
+          <td style="padding:8px 12px;text-align:center;font-size:11px;color:#7a6a5a">{r['情緒']}</td>
+          <td style="padding:8px 12px;text-align:center">
             <div style="display:flex;align-items:center;gap:8px;justify-content:center">
-              <div style="width:60px;height:6px;background:#1f2937;border-radius:3px;overflow:hidden">
+              <div style="width:56px;height:5px;background:#e8dfc8;border-radius:3px;overflow:hidden">
                 <div style="width:{comp_c}%;height:100%;background:{bar_c};border-radius:3px"></div>
               </div>
-              <span style="color:{bar_c};font-weight:700">{comp_c}</span>
+              <span style="color:{bar_c};font-weight:700;font-family:'IBM Plex Mono',monospace">{comp_c}</span>
             </div>
           </td>
-        </tr>
-        """
+        </tr>"""
 
-    st.markdown(header_html + body_rows + "</tbody></table></div>", unsafe_allow_html=True)
+    cmp_html = f"""<!DOCTYPE html><html><head>
+    <meta charset="UTF-8">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+      body{{margin:0;padding:0;background:#faf6ef;font-family:"Noto Sans TC",sans-serif}}
+      table{{width:100%;border-collapse:collapse;font-size:12px}}
+      thead th{{font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:0.8px;
+               color:#9a8a7a;text-align:center;padding:7px 12px;
+               border-bottom:1.5px solid #d4c4a8;white-space:nowrap;font-weight:500}}
+      thead th:first-child{{text-align:left}}
+      tbody tr:hover{{background:#f5efe3!important}}
+    </style>
+    </head><body>
+    <table>
+      <thead><tr>
+        <th style="text-align:left">股票</th>
+        <th>毛利率</th><th>GM評分</th>
+        <th>EPS</th><th>EPS評分</th>
+        <th>FCF率</th><th>FCF評分</th>
+        <th>情緒</th><th>綜合評分</th>
+      </tr></thead>
+      <tbody>{tbl_rows_html}</tbody>
+    </table>
+    </body></html>"""
+
+    tbl_h = 48 + len(rows) * 38 + 20
+    components.html(cmp_html, height=tbl_h, scrolling=False)
 
 
 def _render_metric_placeholder(sym, key, value, label, unit):
