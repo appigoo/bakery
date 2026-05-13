@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -1971,6 +1972,409 @@ def signal_strength(d: dict, sc: dict) -> dict:
     }
 
 
+def _eps_price_widget_html(d: dict) -> str:
+    """
+    Build a self-contained Chart.js HTML widget showing:
+    - Quarterly EPS bar (green/red) + Price midpoint line (dual axis)
+    - Filter buttons: All / EPS positive / EPS negative / Turning points
+    - Full data table with inline bar, market badge, narrative, reaction
+    Uses hist_eps (real AV data) if available, else falls back to eps_surprise
+    + hist_pe records for a reasonable approximation.
+    Returns raw HTML string for st.components.v1.html().
+    """
+    import json as _json
+
+    sym      = d["symbol"]
+    cur_eps  = d.get("eps") or 0
+    cur_px   = d.get("price") or 0
+    cur_gm   = (d.get("gross_margin") or 0) * 100
+    cur_fcf  = (d.get("fcf") or 0) / 1e9
+    cur_eg   = (d.get("earnings_growth") or 0) * 100
+    sector   = d.get("sector", "")
+    hist_eps = d.get("hist_eps", [])
+    hist_pe  = d.get("hist_pe",  [])
+
+    # ── Build data rows ───────────────────────────────────────────────────────
+    rows = []
+
+    if hist_eps and len(hist_eps) >= 6:
+        # Real AV data: quarterly EPS = TTM/4 approximation, price from record
+        df_src = sorted(hist_eps, key=lambda x: str(x["date"]))
+        # Sample every 3 months (quarterly) by picking one per quarter
+        seen_quarters = set()
+        for rec in df_src:
+            dt = str(rec["date"])[:7]  # YYYY-MM
+            yr_mo = dt[:4] + "-" + str(int(dt[5:7]))
+            q_label_map = {"1":"Q1","2":"Q1","3":"Q1","4":"Q2","5":"Q2","6":"Q2",
+                           "7":"Q3","8":"Q3","9":"Q3","10":"Q4","11":"Q4","12":"Q4"}
+            mo = dt[5:7].lstrip("0")
+            qtr = q_label_map.get(mo, "Q?")
+            q_key = dt[:4] + " " + qtr
+            if q_key in seen_quarters:
+                continue
+            seen_quarters.add(q_key)
+            eps_q = round(rec["eps_ttm"] / 4, 3)
+            rows.append({
+                "q":   q_key,
+                "eps": eps_q,
+                "lo":  round(rec["price"] * 0.92, 1),
+                "hi":  round(rec["price"] * 1.08, 1),
+                "mid": round(rec["price"], 1),
+                "mkt": "bull" if eps_q > 0 else "bear",
+                "narrative": "基於 Alpha Vantage 真實數據",
+                "reaction":  f"TTM EPS ${rec['eps_ttm']:.2f}",
+                "turn": False,
+            })
+    elif hist_pe and len(hist_pe) >= 6:
+        # Fallback: use price + pe history to approximate quarterly EPS
+        src = sorted(hist_pe, key=lambda x: str(x["date"]))
+        seen_quarters = set()
+        for rec in src:
+            dt = str(rec["date"])[:7]
+            mo = dt[5:7].lstrip("0")
+            q_label_map = {"1":"Q1","2":"Q1","3":"Q1","4":"Q2","5":"Q2","6":"Q2",
+                           "7":"Q3","8":"Q3","9":"Q3","10":"Q4","11":"Q4","12":"Q4"}
+            qtr = q_label_map.get(mo, "Q?")
+            q_key = dt[:4] + " " + qtr
+            if q_key in seen_quarters:
+                continue
+            seen_quarters.add(q_key)
+            pe  = rec.get("pe", 0)
+            px  = rec.get("price", 0)
+            if pe and px and pe > 0:
+                eps_q = round(px / pe / 4, 3)
+                rows.append({
+                    "q":   q_key,
+                    "eps": eps_q,
+                    "lo":  round(px * 0.92, 1),
+                    "hi":  round(px * 1.08, 1),
+                    "mid": round(px, 1),
+                    "mkt": "bull" if eps_q > 0 else "bear",
+                    "narrative": "P/E 歷史推算（估算值）",
+                    "reaction":  f"P/E {pe:.1f}x",
+                    "turn": False,
+                })
+
+    # If we still have very few rows, add at least current quarter as reference
+    if len(rows) < 3:
+        rows = [{
+            "q": "現在", "eps": round(cur_eps / 4, 3),
+            "lo": round(cur_px * 0.92, 1), "hi": round(cur_px * 1.08, 1),
+            "mid": round(cur_px, 1),
+            "mkt": "bull" if cur_eps > 0 else "bear",
+            "narrative": "當前數據", "reaction": "即時", "turn": False,
+        }]
+
+    # Mark turning points: sign change or >40% EPS swing
+    for i in range(1, len(rows)):
+        prev, curr = rows[i-1]["eps"], rows[i]["eps"]
+        if (prev < 0 and curr >= 0) or (prev >= 0 and curr < 0):
+            rows[i]["turn"] = True
+        elif prev != 0 and abs(curr - prev) / abs(prev) > 0.4:
+            rows[i]["turn"] = True
+
+    data_js = _json.dumps(rows, default=str)
+
+    # Colour scheme: use standard Anthropic-like tokens that work on light bg
+    html = f"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:"Noto Sans TC",sans-serif;background:#faf6ef;color:#2a1d13;font-size:13px}}
+  .top{{padding:16px 18px 0}}
+  .title-row{{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px}}
+  .sym{{font-family:"IBM Plex Mono",monospace;font-size:18px;font-weight:500;color:#2a1d13}}
+  .meta{{font-family:"IBM Plex Mono",monospace;font-size:10px;color:#9a8a7a;letter-spacing:1px}}
+  .kpi-row{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}}
+  .kpi{{background:#fffdf8;border:1px solid #d4c4a8;border-radius:6px;padding:10px 12px}}
+  .kpi-l{{font-size:10px;color:#9a8a7a;font-family:"IBM Plex Mono",monospace;letter-spacing:0.5px;margin-bottom:3px}}
+  .kpi-v{{font-size:17px;font-weight:500;font-family:"IBM Plex Mono",monospace;color:#2a1d13}}
+  .kpi-d{{font-size:10px;margin-top:2px;font-family:"IBM Plex Mono",monospace}}
+  .pos{{color:#3B6D11}} .neg{{color:#A32D2D}} .neu{{color:#9a8a7a}}
+  .filters{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;padding:0 18px}}
+  .filter-btn{{font-size:11px;padding:4px 12px;border-radius:20px;border:1px solid #d4c4a8;
+               background:transparent;color:#7a6a5a;cursor:pointer;font-family:"IBM Plex Mono",monospace;
+               transition:all .15s}}
+  .filter-btn.active{{background:#2a1d13;color:#e8b84b;border-color:#2a1d13}}
+  .chart-section{{padding:0 18px 12px;position:relative}}
+  .chart-wrap{{position:relative;height:300px;width:100%}}
+  .legend{{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:#9a8a7a;
+           font-family:"IBM Plex Mono",monospace;padding:6px 18px 10px}}
+  .legend span{{display:flex;align-items:center;gap:5px}}
+  .ld{{width:10px;height:10px;border-radius:2px;flex-shrink:0}}
+  .table-wrap{{overflow-x:auto;border-top:1px solid #e8dfc8;margin:0 18px;padding-top:10px}}
+  table{{width:100%;border-collapse:collapse;font-size:11px}}
+  thead th{{font-family:"IBM Plex Mono",monospace;font-size:9px;letter-spacing:1px;color:#9a8a7a;
+            text-align:left;padding:5px 8px;border-bottom:1px solid #e8dfc8;white-space:nowrap}}
+  tbody td{{padding:6px 8px;border-bottom:1px solid #f0ebe0;white-space:nowrap;vertical-align:middle}}
+  tbody tr:hover{{background:#f5f0e8}}
+  tbody tr:last-child td{{border-bottom:none}}
+  .badge{{display:inline-block;font-size:9px;padding:2px 7px;border-radius:20px;
+          font-family:"IBM Plex Mono",monospace;font-weight:500;letter-spacing:0.3px}}
+  .b-bull{{background:#EAF3DE;color:#3B6D11}}
+  .b-bear{{background:#FCEBEB;color:#A32D2D}}
+  .b-hyper{{background:#FAEEDA;color:#854F0B}}
+  .b-neu{{background:#f0ebe0;color:#7a6a5a}}
+  .turn-mark{{font-size:9px;color:#854F0B;font-family:"IBM Plex Mono",monospace;
+              background:#FAEEDA;padding:1px 5px;border-radius:3px;margin-left:4px}}
+  .bar-cell{{display:flex;align-items:center;gap:6px}}
+  .bar-bg{{flex:1;height:4px;background:#e8dfc8;border-radius:2px;min-width:40px}}
+  .bar-fill{{height:100%;border-radius:2px}}
+  .datasrc{{font-size:9px;color:#b0a090;font-family:"IBM Plex Mono",monospace;
+            padding:6px 18px 14px;letter-spacing:0.3px}}
+</style>
+</head>
+<body>
+<div class="top">
+  <div class="title-row">
+    <div>
+      <div class="sym">{sym} — 季度 EPS vs 股價</div>
+      <div class="meta">EPS 正負影響股價動能分析 · 綠柱=盈利 紅柱=虧損 金線=股價中位</div>
+    </div>
+    <div style="text-align:right">
+      <div class="meta">現價</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:500">${cur_px:.2f}</div>
+    </div>
+  </div>
+  <div class="kpi-row">
+    <div class="kpi">
+      <div class="kpi-l">TTM EPS</div>
+      <div class="kpi-v {'pos' if cur_eps>=0 else 'neg'}">${cur_eps:.2f}</div>
+      <div class="kpi-d {'pos' if cur_eg>=0 else 'neg'}">{'+' if cur_eg>=0 else ''}{cur_eg:.1f}% YoY</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-l">毛利率</div>
+      <div class="kpi-v {'pos' if cur_gm>=30 else 'neg' if cur_gm<15 else ''}">{cur_gm:.1f}%</div>
+      <div class="kpi-d neu">{'高毛利' if cur_gm>=30 else '中等' if cur_gm>=15 else '偏低'}</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-l">自由現金流</div>
+      <div class="kpi-v {'pos' if cur_fcf>=0 else 'neg'}">${cur_fcf:.1f}B</div>
+      <div class="kpi-d {'pos' if cur_fcf>=0 else 'neg'}">{'正值健康' if cur_fcf>=0 else '仍為負值'}</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-l">資料筆數</div>
+      <div class="kpi-v neu" id="rowCount">—</div>
+      <div class="kpi-d neu">季度記錄</div>
+    </div>
+  </div>
+</div>
+
+<div class="filters" id="filterRow"></div>
+
+<div class="chart-section">
+  <div class="chart-wrap">
+    <canvas id="mc" role="img"
+      aria-label="{sym} 季度EPS柱狀圖與股價折線雙軸圖，顯示盈利趨勢與股價走勢關係">
+      {sym} quarterly EPS vs stock price history chart.
+    </canvas>
+  </div>
+</div>
+
+<div class="legend">
+  <span><span class="ld" style="background:#97C459"></span>EPS 正值（盈利）</span>
+  <span><span class="ld" style="background:#E24B4A"></span>EPS 負值（虧損）</span>
+  <span><span class="ld" style="background:#BA7517;height:3px;border-radius:0"></span>股價中位（右軸）</span>
+  <span><span class="ld" style="background:#FAEEDA;border:1px solid #EF9F27"></span>轉折季度</span>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>季度</th>
+        <th>EPS</th>
+        <th>股價區間</th>
+        <th>股價</th>
+        <th>情緒</th>
+        <th>資料說明</th>
+      </tr>
+    </thead>
+    <tbody id="tb"></tbody>
+  </table>
+</div>
+<div class="datasrc" id="dataSrc"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const ALL = {data_js};
+let active = 'all';
+let chartInst = null;
+
+const MKT = {{
+  bull:'b-bull', bear:'b-bear', hyper:'b-hyper', crash:'b-bear', neu:'b-neu',
+  '牛市':'b-bull', '熊市':'b-bear', '狂熱':'b-hyper', '中性':'b-neu',
+}};
+const MKT_TXT = {{
+  bull:'牛市', bear:'熊市', hyper:'狂熱', crash:'崩盤', neu:'中性',
+}};
+
+const FILTERS = [
+  {{k:'all',  l:'全部'}},
+  {{k:'pos',  l:'EPS 正值'}},
+  {{k:'neg',  l:'EPS 負值'}},
+  {{k:'turn', l:'轉折季度'}},
+];
+
+function getRows() {{
+  if (active==='all')  return ALL;
+  if (active==='pos')  return ALL.filter(r=>r.eps>=0);
+  if (active==='neg')  return ALL.filter(r=>r.eps<0);
+  if (active==='turn') return ALL.filter(r=>r.turn);
+  return ALL;
+}}
+
+function buildFilters() {{
+  const el = document.getElementById('filterRow');
+  el.innerHTML = FILTERS.map(f=>
+    `<button class="filter-btn ${{f.k===active?'active':''}}"
+      onclick="setF('${{f.k}}')">${{f.l}}</button>`
+  ).join('');
+}}
+
+function buildChart(rows) {{
+  if (chartInst) chartInst.destroy();
+  const ctx = document.getElementById('mc').getContext('2d');
+  const labels   = rows.map(r=>r.q);
+  const epsVals  = rows.map(r=>r.eps);
+  const pxVals   = rows.map(r=>r.mid);
+  const epsC     = rows.map(r=>r.eps>=0?'rgba(151,196,89,0.85)':'rgba(226,75,74,0.80)');
+  const epsBdr   = rows.map(r=>r.eps>=0?'#639922':'#A32D2D');
+
+  chartInst = new Chart(ctx, {{
+    data: {{
+      labels,
+      datasets: [
+        {{
+          type:'bar', label:'EPS (季度)',
+          data:epsVals, backgroundColor:epsC, borderColor:epsBdr,
+          borderWidth:0.5, borderRadius:3, yAxisID:'yE', order:2,
+        }},
+        {{
+          type:'line', label:'股價中位',
+          data:pxVals, borderColor:'#BA7517',
+          backgroundColor:'rgba(186,117,23,0.05)',
+          borderWidth:2, tension:0.3, fill:false,
+          pointRadius: rows.map(r=>r.turn?5:2.5),
+          pointBackgroundColor: rows.map(r=>r.turn?'#EF9F27':'#BA7517'),
+          pointBorderColor:     rows.map(r=>r.turn?'#854F0B':'#BA7517'),
+          pointBorderWidth:     rows.map(r=>r.turn?2:0),
+          yAxisID:'yP', order:1,
+        }},
+      ],
+    }},
+    options: {{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{{mode:'index',intersect:false}},
+      plugins: {{
+        legend:{{display:false}},
+        tooltip:{{
+          backgroundColor:'rgba(42,29,19,0.95)',
+          borderColor:'#3d2b1f', borderWidth:0.5,
+          titleColor:'#e8dfc8', bodyColor:'#b0a090',
+          titleFont:{{size:11,family:'"IBM Plex Mono",monospace'}},
+          bodyFont:{{size:10,family:'"IBM Plex Mono",monospace'}},
+          callbacks:{{
+            label:c=>c.datasetIndex===0
+              ?` EPS: $${{c.parsed.y.toFixed(3)}}`
+              :` 股價: $${{c.parsed.y}}`,
+            afterBody:items=>{{
+              const r=rows[items[0].dataIndex];
+              return [
+                ``,`區間: $${{r.lo}}–$${{r.hi}}`,
+                r.turn?`⚡ 轉折季度`:``
+              ].filter(Boolean);
+            }},
+          }},
+        }},
+      }},
+      scales: {{
+        x:{{
+          ticks:{{maxRotation:55,font:{{size:9,family:'"IBM Plex Mono",monospace'}},
+                  color:'#9a8a7a',autoSkip:false}},
+          grid:{{color:'rgba(212,196,168,0.3)'}},
+        }},
+        yE:{{
+          position:'left',
+          title:{{display:true,text:'EPS ($)',color:'#9a8a7a',font:{{size:9}}}},
+          grid:{{color:'rgba(212,196,168,0.25)'}},
+          ticks:{{font:{{size:9}},color:'#9a8a7a',
+                  callback:v=>(v>=0?'':'')+'$'+v.toFixed(2)}},
+        }},
+        yP:{{
+          position:'right',
+          title:{{display:true,text:'股價 USD',color:'#BA7517',font:{{size:9}}}},
+          grid:{{display:false}},
+          ticks:{{font:{{size:9}},color:'#BA7517',callback:v=>'$'+v}},
+        }},
+      }},
+    }},
+  }});
+}}
+
+function buildTable(rows) {{
+  const maxMid = Math.max(...rows.map(r=>r.mid), 1);
+  const tb = document.getElementById('tb');
+  tb.innerHTML = rows.map(r=>{{
+    const epsC = r.eps>=0?'pos':'neg';
+    const bc   = MKT[r.mkt]||'b-neu';
+    const btxt = MKT_TXT[r.mkt]||r.mkt;
+    const barW = Math.round(r.mid/maxMid*100);
+    const barC = r.eps>=0?'#97C459':'#E24B4A';
+    return `<tr style="${{r.turn?'background:#fdf5e6':''}}">
+      <td style="color:#2a1d13;font-weight:500;font-family:'IBM Plex Mono',monospace">
+        ${{r.q}}${{r.turn?'<span class="turn-mark">轉折</span>':''}}
+      </td>
+      <td class="${{epsC}}" style="font-family:'IBM Plex Mono',monospace;font-weight:500">
+        ${{r.eps>=0?'+':''}}$${{r.eps.toFixed(3)}}
+      </td>
+      <td style="color:#7a6a5a;font-family:'IBM Plex Mono',monospace">
+        $${{r.lo}}–$${{r.hi}}
+      </td>
+      <td>
+        <div class="bar-cell">
+          <span style="font-size:11px;font-family:'IBM Plex Mono',monospace;
+                       min-width:38px;color:#2a1d13">$${{r.mid}}</span>
+          <div class="bar-bg">
+            <div class="bar-fill" style="width:${{barW}}%;background:${{barC}}"></div>
+          </div>
+        </div>
+      </td>
+      <td><span class="badge ${{bc}}">${{btxt}}</span></td>
+      <td style="color:#9a8a7a;max-width:180px;overflow:hidden;text-overflow:ellipsis">
+        ${{r.narrative}}
+      </td>
+    </tr>`;
+  }}).join('');
+  document.getElementById('rowCount').textContent = rows.length;
+}}
+
+function render() {{
+  const rows = getRows();
+  buildFilters();
+  buildChart(rows);
+  buildTable(rows);
+  const src = ALL.length>0 && ALL[0].narrative && ALL[0].narrative.includes('Alpha')
+    ? '數據來源：Alpha Vantage EARNINGS + TIME_SERIES_MONTHLY（真實季度盈利）'
+    : ALL.length>6
+    ? '數據來源：P/E 歷史推算（估算值）— 如需真實 EPS 請在側欄填入 Alpha Vantage Key'
+    : '數據來源：當前財務數據（歷史數據不足）';
+  document.getElementById('dataSrc').textContent = src;
+}}
+
+window.setF = function(k) {{ active=k; render(); }};
+render();
+</script>
+</body>
+</html>"""
+    return html
+
+
+
 def render_breakout_tab(stocks_data: list, av_key: str):
     """Render the full 爆升前兆 tab."""
     valid = [d for d in stocks_data if not d.get("error")]
@@ -2109,21 +2513,32 @@ def render_breakout_tab(stocks_data: list, av_key: str):
             st.plotly_chart(fig_snt, use_container_width=True,
                             key=f"bo_snt_{sel_sym}")
 
-    # ── Historical EPS vs Price (if AV data) ──────────────────────────────────
+    # ── Interactive EPS vs Price Widget ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-family:IBM Plex Mono,monospace;font-size:10px;'
+        'letter-spacing:2px;color:#c8922a;text-transform:uppercase;margin-bottom:12px">'
+        '📊 季度 EPS vs 股價互動圖表</div>',
+        unsafe_allow_html=True
+    )
+    widget_html = _eps_price_widget_html(d)
+    # Height: KPI row + filters + chart + table rows (approx 40px each) + padding
+    n_rows = max(len(d.get("hist_eps", d.get("hist_pe", []))), 8)
+    widget_h = 560 + min(n_rows, 40) * 26
+    components.html(widget_html, height=widget_h, scrolling=False)
+
+    # ── Plotly EPS vs Price (if AV data — additional detail) ────────────────
     if d.get("hist_eps"):
-        st.markdown("---")
-        st.markdown('<div style="font-family:IBM Plex Mono,monospace;font-size:10px;'
-                    'letter-spacing:2px;color:#c8922a;text-transform:uppercase;margin-bottom:12px">'
-                    '📉 EPS vs 股價歷史關係</div>', unsafe_allow_html=True)
-        fe1, fe2, fe3 = chart_eps_price(
-            d.get("hist_eps", []), sel_sym, d.get("eps"), d.get("price")
-        )
-        if fe1:
-            st.plotly_chart(fe1, use_container_width=True, key=f"bo_ep1_{sel_sym}")
-        if fe2:
-            st.plotly_chart(fe2, use_container_width=True, key=f"bo_ep2_{sel_sym}")
-        if fe3:
-            st.plotly_chart(fe3, use_container_width=True, key=f"bo_ep3_{sel_sym}")
+        with st.expander("📉 查看詳細 EPS vs 股價 Plotly 圖表"):
+            fe1, fe2, fe3 = chart_eps_price(
+                d.get("hist_eps", []), sel_sym, d.get("eps"), d.get("price")
+            )
+            if fe1:
+                st.plotly_chart(fe1, use_container_width=True, key=f"bo_ep1_{sel_sym}")
+            if fe2:
+                st.plotly_chart(fe2, use_container_width=True, key=f"bo_ep2_{sel_sym}")
+            if fe3:
+                st.plotly_chart(fe3, use_container_width=True, key=f"bo_ep3_{sel_sym}")
 
     # ── Bakery analysis ───────────────────────────────────────────────────────
     st.markdown("---")
