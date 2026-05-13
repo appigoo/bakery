@@ -388,7 +388,7 @@ def _empty_result(symbol: str) -> dict:
         "industry": "", "52w_high": None, "52w_low": None, "beta": None,
         "revenue": None, "net_income": None, "rev_growth": None,
         "earnings_growth": None, "analyst_target": None,
-        "hist_pe": [], "eps_surprise": [], "dividend_yield": None,
+        "hist_pe": [], "eps_surprise": [], "hist_eps": [], "dividend_yield": None,
         "short_ratio": None, "data_source": "none", "error": None,
     }
 
@@ -450,6 +450,8 @@ def _fetch_yfinance(symbol: str) -> dict:
         qearnings = None
 
     eps_surprise = []
+    hist_eps     = []   # [{date, eps_ttm, price}] for EPS vs Price chart
+
     if qearnings is not None and not qearnings.empty:
         for i, (idx, row) in enumerate(qearnings.iterrows()):
             if i >= 4: break
@@ -462,6 +464,37 @@ def _fetch_yfinance(symbol: str) -> dict:
                     "estimate":     estimate,
                     "surprise_pct": round((actual - estimate) / abs(estimate) * 100, 1),
                 })
+
+    # Build quarterly TTM EPS + price history for EPS vs Price chart
+    try:
+        q_earn_full = tk.quarterly_earnings
+        hist_mth    = tk.history(period="5y", interval="1mo")
+        hist_px     = hist_mth["Close"].dropna() if not hist_mth.empty else pd.Series(dtype=float)
+
+        if q_earn_full is not None and not q_earn_full.empty and not hist_px.empty:
+            q_earn_full = q_earn_full.sort_index()
+            eps_vals_f  = q_earn_full.get("Earnings", pd.Series(dtype=float))
+            for date, px in hist_px.items():
+                prior = eps_vals_f[eps_vals_f.index <= date]
+                if len(prior) >= 4:
+                    ttm_eps = prior.iloc[-4:].sum()
+                    if ttm_eps and ttm_eps > 0 and px > 0:
+                        hist_eps.append({
+                            "date":    date,
+                            "eps_ttm": round(float(ttm_eps), 4),
+                            "price":   round(float(px), 2),
+                        })
+        elif trailing_eps and trailing_eps > 0 and not hist_px.empty:
+            # fallback: constant EPS across history (less accurate)
+            for date, px in hist_px.items():
+                if px > 0:
+                    hist_eps.append({
+                        "date":    date,
+                        "eps_ttm": round(float(trailing_eps), 4),
+                        "price":   round(float(px), 2),
+                    })
+    except Exception:
+        hist_eps = []
 
     result = _empty_result(symbol)
     result.update({
@@ -492,6 +525,7 @@ def _fetch_yfinance(symbol: str) -> dict:
         "analyst_target": info.get("targetMeanPrice"),
         "hist_pe":        _build_hist_pe(tk, trailing_eps),
         "eps_surprise":   eps_surprise,
+        "hist_eps":       hist_eps,
         "dividend_yield": info.get("dividendYield"),
         "short_ratio":    info.get("shortRatio"),
         "data_source":    "yfinance",
@@ -1303,6 +1337,225 @@ def chart_pe_price_relationship(hist_pe: list, symbol: str, current_pe: float, c
 
     return fig1, None
 
+
+def chart_eps_price(hist_eps: list, symbol: str,
+                    current_eps: float, current_price: float) -> tuple:
+    """
+    Returns (fig_dual, fig_scatter, fig_growth):
+    fig_dual    — top: price history, bottom: TTM EPS history (dual-panel)
+    fig_scatter — EPS vs Price scatter with regression + current marker
+    fig_growth  — EPS YoY growth rate bars
+    """
+    if not hist_eps or len(hist_eps) < 6:
+        return None, None, None
+
+    df = pd.DataFrame(hist_eps).copy()
+    df = df.dropna(subset=["eps_ttm", "price"])
+    df = df[df["eps_ttm"] > 0]
+    if len(df) < 6:
+        return None, None, None
+
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # ── YoY EPS growth (compare same month 12 steps back) ────────────────────
+    df["eps_yoy"] = None
+    for i in range(12, len(df)):
+        prev_eps = df.loc[i - 12, "eps_ttm"]
+        if prev_eps and prev_eps > 0:
+            df.loc[i, "eps_yoy"] = round(
+                (df.loc[i, "eps_ttm"] - prev_eps) / prev_eps * 100, 1
+            )
+
+    avg_eps = df["eps_ttm"].mean()
+    max_eps = df["eps_ttm"].max()
+    min_eps = df["eps_ttm"].min()
+
+    # ── Fig 1: Dual-panel Price + EPS ─────────────────────────────────────────
+    fig1 = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.52, 0.48],
+        vertical_spacing=0.07,
+        subplot_titles=("股價走勢 Price", "TTM 每股盈餘 EPS")
+    )
+
+    # Row 1: Price
+    fig1.add_trace(go.Scatter(
+        x=df["date"], y=df["price"],
+        mode="lines", name="股價",
+        line=dict(color="#c8922a", width=2),
+        fill="tozeroy", fillcolor="rgba(200,146,42,0.06)",
+        hovertemplate="日期: %{x|%Y-%m}<br>股價: $%{y:.2f}<extra></extra>"
+    ), row=1, col=1)
+    if current_price:
+        fig1.add_hline(y=current_price, line_dash="dot",
+                       line_color="#b84040", line_width=1.2,
+                       annotation_text=f"現價 ${current_price:.0f}",
+                       annotation_position="right",
+                       annotation_font=dict(size=9, color="#b84040"),
+                       row=1, col=1)
+
+    # Row 2: TTM EPS — colour bars by growth vs prior year
+    bar_colors = []
+    for i, row_v in df.iterrows():
+        yoy = row_v["eps_yoy"]
+        if yoy is None:    bar_colors.append("#b0a080")
+        elif yoy >= 15:    bar_colors.append("#2a7a2a")
+        elif yoy >= 5:     bar_colors.append("#4a9a4a")
+        elif yoy >= 0:     bar_colors.append("#a0c080")
+        elif yoy >= -10:   bar_colors.append("#e8a060")
+        else:              bar_colors.append("#b84040")
+
+    fig1.add_trace(go.Bar(
+        x=df["date"], y=df["eps_ttm"],
+        name="TTM EPS",
+        marker_color=bar_colors,
+        hovertemplate="日期: %{x|%Y-%m}<br>TTM EPS: $%{y:.2f}<extra></extra>"
+    ), row=2, col=1)
+
+    # Trend line on EPS
+    if len(df) > 5:
+        z = np.polyfit(range(len(df)), df["eps_ttm"], 1)
+        trend = np.poly1d(z)(range(len(df)))
+        fig1.add_trace(go.Scatter(
+            x=df["date"], y=trend,
+            mode="lines", name="EPS趨勢",
+            line=dict(color="#2a1d13", dash="dash", width=1.2),
+            showlegend=False
+        ), row=2, col=1)
+
+    if current_eps:
+        fig1.add_hline(y=current_eps, line_dash="dot",
+                       line_color="#b84040", line_width=1.2,
+                       annotation_text=f"現在 ${current_eps:.2f}",
+                       annotation_position="right",
+                       annotation_font=dict(size=9, color="#b84040"),
+                       row=2, col=1)
+
+    fig1.update_layout(
+        title=f"{symbol}  股價 & TTM EPS 歷史走勢（5年）",
+        height=520,
+        paper_bgcolor=CHART_THEME["paper_bgcolor"],
+        plot_bgcolor=CHART_THEME["plot_bgcolor"],
+        font=CHART_THEME["font"],
+        showlegend=False,
+        margin=dict(t=60, b=20, l=20, r=90),
+        bargap=0.15,
+    )
+    fig1.update_yaxes(gridcolor=CHART_THEME["gridcolor"])
+    fig1.update_xaxes(gridcolor="rgba(0,0,0,0)")
+    fig1.update_yaxes(title_text="股價 (USD)", row=1, col=1)
+    fig1.update_yaxes(title_text="TTM EPS ($)", row=2, col=1)
+
+    # ── Fig 2: EPS vs Price scatter ────────────────────────────────────────────
+    fig2 = go.Figure()
+
+    # Colour by EPS growth
+    pt_colors = []
+    for _, r2 in df.iterrows():
+        yoy = r2["eps_yoy"]
+        if yoy is None:  pt_colors.append("#b0a080")
+        elif yoy >= 15:  pt_colors.append("#2a7a2a")
+        elif yoy >= 0:   pt_colors.append("#c8922a")
+        else:            pt_colors.append("#b84040")
+
+    fig2.add_trace(go.Scatter(
+        x=df["eps_ttm"], y=df["price"],
+        mode="markers",
+        marker=dict(color=pt_colors, size=7, opacity=0.80,
+                    line=dict(width=0.5, color="#2a1d13")),
+        text=[str(d)[:7] for d in df["date"]],
+        hovertemplate=(
+            "日期: %{text}<br>"
+            "TTM EPS: $%{x:.2f}<br>"
+            "股價: $%{y:.2f}<extra></extra>"
+        ),
+        name="月度數據"
+    ))
+
+    # Regression line
+    if len(df) > 5:
+        z2   = np.polyfit(df["eps_ttm"], df["price"], 1)
+        p_fn = np.poly1d(z2)
+        eps_r = np.linspace(df["eps_ttm"].min(), df["eps_ttm"].max(), 60)
+        fig2.add_trace(go.Scatter(
+            x=eps_r, y=p_fn(eps_r),
+            mode="lines",
+            line=dict(color="#2a1d13", dash="dash", width=1.5),
+            showlegend=False
+        ))
+        corr2 = np.corrcoef(df["eps_ttm"], df["price"])[0, 1]
+        # Fair value line annotation
+        fig2.add_annotation(
+            x=0.03, y=0.96, xref="paper", yref="paper",
+            text=f"相關係數 r = {corr2:.2f}",
+            showarrow=False, font=dict(size=10, color="#2a1d13"),
+            bgcolor="rgba(255,253,248,0.88)",
+            bordercolor=CHART_THEME["gridcolor"], borderwidth=1
+        )
+
+    # Current point
+    if current_eps and current_price:
+        fig2.add_trace(go.Scatter(
+            x=[current_eps], y=[current_price],
+            mode="markers+text",
+            marker=dict(color="#b84040", size=13, symbol="star",
+                        line=dict(width=1.5, color="#2a1d13")),
+            text=["現在"], textposition="top right",
+            textfont=dict(size=10, color="#b84040"),
+            showlegend=False
+        ))
+
+    fig2.update_layout(
+        title=f"{symbol}  TTM EPS vs 股價 散點圖（EPS 增長帶動股價上升）",
+        height=370,
+        paper_bgcolor=CHART_THEME["paper_bgcolor"],
+        plot_bgcolor=CHART_THEME["plot_bgcolor"],
+        font=CHART_THEME["font"],
+        xaxis=dict(title="TTM EPS ($)", gridcolor=CHART_THEME["gridcolor"]),
+        yaxis=dict(title="股價 (USD)", gridcolor=CHART_THEME["gridcolor"]),
+        margin=dict(t=55, b=30, l=20, r=20),
+        showlegend=False,
+    )
+
+    # ── Fig 3: YoY EPS growth bar chart ──────────────────────────────────────
+    df_yoy = df.dropna(subset=["eps_yoy"]).copy()
+    if not df_yoy.empty:
+        bar_c3 = ["#2a7a2a" if v >= 15 else "#4a9a4a" if v >= 5
+                  else "#a0c080" if v >= 0 else "#e8a060" if v >= -10
+                  else "#b84040"
+                  for v in df_yoy["eps_yoy"]]
+        fig3 = go.Figure(go.Bar(
+            x=df_yoy["date"], y=df_yoy["eps_yoy"],
+            marker_color=bar_c3,
+            text=[f"{v:+.1f}%" for v in df_yoy["eps_yoy"]],
+            textposition="outside",
+            textfont=dict(size=9),
+            hovertemplate="日期: %{x|%Y-%m}<br>EPS YoY: %{y:.1f}%<extra></extra>"
+        ))
+        fig3.add_hline(y=0, line_color="#2a1d13", line_width=1)
+        fig3.add_hline(y=df_yoy["eps_yoy"].mean(),
+                       line_dash="dash", line_color="#c8922a", line_width=1.2,
+                       annotation_text=f"均值 {df_yoy['eps_yoy'].mean():+.1f}%",
+                       annotation_position="right",
+                       annotation_font=dict(size=9, color="#c8922a"))
+        fig3.update_layout(
+            title=f"{symbol}  EPS 同比增長率（YoY %）",
+            height=300,
+            paper_bgcolor=CHART_THEME["paper_bgcolor"],
+            plot_bgcolor=CHART_THEME["plot_bgcolor"],
+            font=CHART_THEME["font"],
+            yaxis=dict(title="YoY %", gridcolor=CHART_THEME["gridcolor"],
+                       zeroline=True, zerolinecolor="#2a1d13"),
+            xaxis=dict(gridcolor="rgba(0,0,0,0)"),
+            margin=dict(t=50, b=20, l=20, r=80),
+            showlegend=False,
+        )
+    else:
+        fig3 = None
+
+    return fig1, fig2, fig3
+
 def chart_quadrant(stocks_data: list):
     syms, pe_ratios, rg_vals, sizes, colors_q, scores_q = [], [], [], [], [], []
     for d in stocks_data:
@@ -1930,7 +2183,12 @@ def main():
             sel_px  = sel_d.get("price")
 
             # Sub-tabs for different chart views
-            ctab1, ctab2, ctab3 = st.tabs(["📉 P/E 走勢", "🔗 股價 & P/E 雙軸圖", "🔵 P/E vs 股價 散點"])
+            ctab1, ctab2, ctab3, ctab4 = st.tabs([
+                "📉 P/E 走勢",
+                "🔗 股價 & P/E 雙軸圖",
+                "🔵 P/E vs 股價 散點",
+                "💰 EPS vs 股價",
+            ])
 
             with ctab1:
                 fig_hist = chart_hist_pe(sel_d["hist_pe"], sel_sym, sel_pe)
@@ -1981,6 +2239,38 @@ def main():
                     """, unsafe_allow_html=True)
                 else:
                     st.info("需要完整股價數據才能生成散點圖（yfinance 數據源）")
+
+            with ctab4:
+                hist_eps_data = sel_d.get("hist_eps", [])
+                cur_eps       = sel_d.get("eps")
+                fig_ep1, fig_ep2, fig_ep3 = chart_eps_price(
+                    hist_eps_data, sel_sym, cur_eps, sel_px
+                )
+                if fig_ep1:
+                    st.plotly_chart(fig_ep1, use_container_width=True,
+                                    key=f"eps_dual_{sel_sym}")
+                    st.caption(
+                        "📊 上圖：股價走勢　|　下圖：TTM EPS（棒顏色 = YoY增長速度）"
+                        "　🟢深綠 ≥+15%　🟢淺綠 +5%~15%　🟡 +0%~5%　🟠 -10%~0%　🔴 < -10%"
+                    )
+                if fig_ep2:
+                    st.plotly_chart(fig_ep2, use_container_width=True,
+                                    key=f"eps_scatter_{sel_sym}")
+                    st.markdown("""
+                    <div style="font-size:12px;color:#7a6a5a;margin-top:-8px;padding:10px 14px;
+                                background:#f5efe3;border-radius:4px;line-height:1.8">
+                    🥖 <b>麵包店比喻：</b>這張圖顯示「店舖盈利（EPS）」與「買家出價（股價）」的關係。<br>
+                    EPS 愈高，股價通常愈貴——就像麵包店年年賺多了，收購價自然水漲船高。<br>
+                    <b>相關係數 r 愈高（接近1），代表股價跟盈利走得愈齊——是健康的估值形態。</b><br>
+                    如果股價飆升但 EPS 無升，⭐現在點就會偏離趨勢線，代表估值已超前盈利。
+                    </div>
+                    """, unsafe_allow_html=True)
+                if fig_ep3:
+                    st.plotly_chart(fig_ep3, use_container_width=True,
+                                    key=f"eps_growth_{sel_sym}")
+                    st.caption("📊 EPS 同比增長率（YoY%）— 連續正增長代表盈利質素穩定")
+                if not fig_ep1 and not fig_ep2:
+                    st.info("暫無足夠 EPS 歷史數據（需要 yfinance 數據源且有季度盈利記錄）")
 
             # Scoring reasons (always show)
             sc = score_stock(sel_d)
@@ -2183,6 +2473,20 @@ def main():
                 if fig_scat_t4:
                     st.plotly_chart(fig_scat_t4, use_container_width=True,
                                     key=f"scat_{sym_k}_tab4")
+
+                # EPS vs Price charts
+                h_eps_t4 = d.get("hist_eps", [])
+                if h_eps_t4:
+                    fe1, fe2, fe3 = chart_eps_price(h_eps_t4, sym_k, c_pe and d.get("eps"), c_px)
+                    if fe1:
+                        st.plotly_chart(fe1, use_container_width=True,
+                                        key=f"eps_dual_{sym_k}_t4")
+                    if fe2:
+                        st.plotly_chart(fe2, use_container_width=True,
+                                        key=f"eps_scat_{sym_k}_t4")
+                    if fe3:
+                        st.plotly_chart(fe3, use_container_width=True,
+                                        key=f"eps_grow_{sym_k}_t4")
 
                 st.markdown("---")
                 render_ai_prompt_buttons(d, sc)
