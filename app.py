@@ -2050,19 +2050,19 @@ def _eps_price_widget_html(d: dict) -> str:
 
     def build_rows_price_only(hist_pe_list, eps_surprise_list):
         """
-        Build rows using REAL quarterly EPS from eps_surprise (past 4Q)
-        + price history from hist_pe. Does NOT derive EPS from P/E
-        (that causes circular flat values). For quarters without real EPS,
-        shows price trend only (eps=None rendered as gap in chart).
+        Build quarterly rows using:
+        1. Stock price history from hist_pe (accurate)
+        2. Real EPS for recent quarters from eps_surprise.actual
+        3. Estimated EPS for older quarters by back-casting with earnings_growth rate
+        Labels estimated quarters clearly. Never uses price/PE circular derivation.
         """
         mo_to_q = {"1":"Q1","2":"Q1","3":"Q1","4":"Q2","5":"Q2","6":"Q2",
                    "7":"Q3","8":"Q3","9":"Q3","10":"Q4","11":"Q4","12":"Q4"}
 
-        # Build real EPS lookup from eps_surprise {quarter_str -> actual_eps}
-        # eps_surprise quarter format: "2024-09" or "2024Q3" etc
+        # Build real EPS lookup from eps_surprise {q_key -> actual_eps}
         real_eps = {}
         for rec in (eps_surprise_list or []):
-            q_raw = str(rec.get("quarter",""))[:7]  # "YYYY-MM"
+            q_raw = str(rec.get("quarter",""))[:7]
             if len(q_raw) >= 7:
                 mo  = q_raw[5:7].lstrip("0") or "0"
                 q_k = q_raw[:4] + " " + mo_to_q.get(mo, "Q?")
@@ -2070,9 +2070,18 @@ def _eps_price_widget_html(d: dict) -> str:
                 if actual is not None:
                     real_eps[q_k] = round(float(actual), 3)
 
-        # Build price rows from hist_pe (sampled quarterly)
+        # Back-cast estimated EPS using earnings growth rate
+        # Formula: eps_N_quarters_ago = current_eps / (1+annual_growth)^(N/4)
+        # Use quarterly compounding from current TTM EPS
+        eg_annual = d.get("earnings_growth") or 0  # e.g. 0.95 for 95%
+        # Cap growth rate to avoid extreme extrapolation
+        eg_annual = max(min(eg_annual, 2.0), -0.5)
+        eg_q = (1 + eg_annual) ** 0.25  # quarterly growth factor
+
+        # Build price rows, sampled quarterly
         rows = []
         seen = set()
+        price_rows = []
         for rec in sorted(hist_pe_list, key=lambda x: str(x.get("date",""))):
             dt = str(rec.get("date",""))[:7]
             if len(dt) < 7: continue
@@ -2080,25 +2089,44 @@ def _eps_price_widget_html(d: dict) -> str:
             q_key = dt[:4] + " " + mo_to_q.get(mo, "Q?")
             if q_key in seen: continue
             seen.add(q_key)
-            px  = rec.get("price", 0)
+            px = rec.get("price", 0)
             if not px: continue
+            price_rows.append({"q": q_key, "px": round(px, 1),
+                                "lo": round(px*0.92,1), "hi": round(px*1.08,1)})
 
-            # Use real EPS if available for this quarter, else None
-            eps_real = real_eps.get(q_key)
-            narrative = "真實季度 EPS" if eps_real is not None else "股價數據（EPS 待補充）"
-            reaction  = f"實際 EPS ${eps_real:.2f}" if eps_real is not None else f"P/E {rec.get('pe',0):.1f}x"
-            mkt       = ("bull" if eps_real > 0 else "bear") if eps_real is not None else "neu"
+        n = len(price_rows)
+        for i, pr in enumerate(price_rows):
+            q_key = pr["q"]
+            quarters_from_now = n - 1 - i  # 0 = most recent
 
+            if q_key in real_eps:
+                # Use actual reported EPS
+                eps_val   = real_eps[q_key]
+                narrative = "真實季度 EPS（已報告）"
+                reaction  = f"實際 ${eps_val:.2f}"
+                is_est    = False
+            elif eg_annual != 0 and cur_eps != 0:
+                # Estimate by back-casting from current EPS
+                eps_val   = round(cur_eps / 4 / (eg_q ** quarters_from_now), 3)
+                narrative = "估算 EPS（增長率反推）"
+                reaction  = f"增長率 {eg_annual*100:.0f}%/年"
+                is_est    = True
+            else:
+                eps_val   = None
+                narrative = "股價數據（EPS 待補充）"
+                reaction  = ""
+                is_est    = True
+
+            mkt = "bull" if eps_val and eps_val > 0 else "bear" if eps_val and eps_val < 0 else "neu"
             rows.append({
-                "q": q_key,
-                "eps": eps_real,          # None = no bar shown in chart
-                "lo": round(px*0.92,1), "hi": round(px*1.08,1), "mid": round(px,1),
-                "mkt": mkt,
-                "narrative": narrative, "reaction": reaction, "turn": False,
+                "q": q_key, "eps": eps_val,
+                "lo": pr["lo"], "hi": pr["hi"], "mid": pr["px"],
+                "mkt": mkt, "narrative": narrative,
+                "reaction": reaction, "turn": False, "est": is_est,
             })
 
-        # Mark turning points only where real EPS exists
-        real_rows = [r for r in rows if r["eps"] is not None]
+        # Mark turning points only on real EPS data
+        real_rows = [r for r in rows if r.get("eps") is not None and not r.get("est")]
         for i in range(1, len(real_rows)):
             prev, curr = real_rows[i-1]["eps"], real_rows[i]["eps"]
             if (prev < 0 <= curr) or (curr < 0 <= prev):
@@ -2120,10 +2148,13 @@ def _eps_price_widget_html(d: dict) -> str:
         # Use real eps_surprise EPS for recent quarters + price history
         # Never derive EPS from P/E — that creates circular flat values
         rows = build_rows_price_only(hist_pe, eps_surprise)
-        n_real = sum(1 for r in rows if r.get("eps") is not None)
+        n_real = sum(1 for r in rows if r.get("eps") is not None and not r.get("est"))
+        n_est  = sum(1 for r in rows if r.get("est"))
         data_src_note = (
-            f"數據來源：股價來自 yfinance 歷史數據 · 近期 {n_real} 季 EPS 來自真實報告 · "
-            f"如需完整 EPS 歷史請填入 Alpha Vantage Key · {sym}"
+            f"數據來源：股價來自 yfinance 歷史記錄（準確） · "
+            f"近期 {n_real} 季 EPS 來自真實報告（深色柱） · "
+            f"{n_est} 季為增長率反推估算（淺色柱，標「估」） · "
+            f"如需完整真實 EPS 歷史請在側欄填入 Alpha Vantage Key"
         )
     else:
         rows = [{"q":"現在","eps":round(cur_eps/4,3),"lo":round(cur_px*0.92,1),
@@ -2249,8 +2280,9 @@ tbody tr:hover{{background:#f5f0e6}}
 </div>
 
 <div class="legend">
-  <span><span class="ld" style="background:#97C459"></span>EPS 正值（盈利）</span>
-  <span><span class="ld" style="background:#E24B4A"></span>EPS 負值（虧損）</span>
+  <span><span class="ld" style="background:#97C459"></span>EPS 真實（盈利）</span>
+  <span><span class="ld" style="background:#E24B4A"></span>EPS 真實（虧損）</span>
+  <span><span class="ld" style="background:rgba(151,196,89,0.35);border:1px dashed #639922"></span>EPS 估算（增長率反推）</span>
   <span><span class="ld" style="background:#BA7517;height:3px;border-radius:0"></span>股價中位（右軸）</span>
   <span><span class="ld" style="background:#FAEEDA;border:1px solid #EF9F27"></span>轉折季度</span>
 </div>
@@ -2310,13 +2342,21 @@ function buildChart(data) {{
       labels: data.map(r=>r.q),
       datasets: [
         {{
-          type:'bar', label:'EPS',
-          data: data.map(r=>r.eps!==null && r.eps!==undefined ? r.eps : null),
-          backgroundColor: data.map(r=>r.eps===null||r.eps===undefined?'transparent':r.eps>=0?'rgba(151,196,89,0.85)':'rgba(226,75,74,0.82)'),
-          borderColor:     data.map(r=>r.eps===null||r.eps===undefined?'transparent':r.eps>=0?'#639922':'#A32D2D'),
-          borderWidth:0.5, borderRadius:3,
-          skipNull:true,
+          type:'bar', label:'EPS（真實）',
+          data: data.map(r=>(r.eps!==null&&r.eps!==undefined&&!r.est)?r.eps:null),
+          backgroundColor: data.map(r=>(!r.est&&r.eps!==null)?(r.eps>=0?'rgba(151,196,89,0.88)':'rgba(226,75,74,0.85)'):'transparent'),
+          borderColor:     data.map(r=>(!r.est&&r.eps!==null)?(r.eps>=0?'#639922':'#A32D2D'):'transparent'),
+          borderWidth:0.5, borderRadius:3, skipNull:true,
           yAxisID:'yE', order:2,
+        }},
+        {{
+          type:'bar', label:'EPS（估算）',
+          data: data.map(r=>(r.eps!==null&&r.eps!==undefined&&r.est)?r.eps:null),
+          backgroundColor: data.map(r=>(r.est&&r.eps!==null)?(r.eps>=0?'rgba(151,196,89,0.35)':'rgba(226,75,74,0.30)'):'transparent'),
+          borderColor:     data.map(r=>(r.est&&r.eps!==null)?(r.eps>=0?'#639922':'#A32D2D'):'transparent'),
+          borderWidth:0.5, borderRadius:3, skipNull:true,
+          borderDash:[3,3],
+          yAxisID:'yE', order:3,
         }},
         {{
           type:'line', label:'股價中位',
@@ -2388,20 +2428,25 @@ function buildTable(data) {{
   document.getElementById('rcnt').textContent = data.length;
   document.getElementById('tb').innerHTML = data.map(r=>{{
     const hasEps  = r.eps !== null && r.eps !== undefined;
+    const isEst   = r.est === true;
     const epsCls  = hasEps ? (r.eps>=0?'pos':'neg') : 'neu';
     const epsSign = hasEps && r.eps>=0 ? '+' : '';
-    const epsTxt  = hasEps ? `${{epsSign}}$${{r.eps.toFixed(2)}}` : '<span style="color:#b0a090">—</span>';
+    const epsTxt  = hasEps
+      ? `${{epsSign}}$${{r.eps.toFixed(2)}}${{isEst?'<span style="font-size:9px;color:#b0a090;margin-left:3px">估</span>':''}}`
+      : '<span style="color:#b0a090">—</span>';
+    const epsStyle = isEst ? 'opacity:0.65;font-style:italic' : '';
     const bc      = MKT_CLS[r.mkt]||'b-neu';
     const bt      = MKT_TXT[r.mkt]||r.mkt;
     const bw      = Math.round(r.mid/maxMid*100);
     const bc2     = hasEps ? (r.eps>=0?'#97C459':'#E24B4A') : '#d4c4a8';
+    const bc2op   = isEst ? bc2+'99' : bc2;
     return `<tr class="${{r.turn?'turn-row':''}}">
       <td class="qcell">${{r.q}}${{r.turn?'<span class="turn-tag">轉折</span>':''}}</td>
-      <td class="eps-cell ${{epsCls}}">${{epsTxt}}</td>
+      <td class="eps-cell ${{epsCls}}" style="${{epsStyle}}">${{epsTxt}}</td>
       <td class="range-cell">$${{r.lo}}–$${{r.hi}}</td>
       <td><div class="mid-cell">
         <span class="mid-num">$${{r.mid}}</span>
-        <div class="bar-bg"><div class="bar-fill" style="width:${{bw}}%;background:${{bc2}}"></div></div>
+        <div class="bar-bg"><div class="bar-fill" style="width:${{bw}}%;background:${{bc2op}}"></div></div>
       </div></td>
       <td><span class="badge ${{bc}}">${{bt}}</span></td>
       <td class="narr-cell">${{r.narrative}}</td>
